@@ -1,21 +1,30 @@
 # Proxy and route core
 
-The proxy resolves the normalized HTTP `Host` or HTTP/2 `:authority` value
-against an exact route. Route names are lowercase ASCII DNS names below
-`.localhost`; wildcards, suffix matching, IP literals, userinfo, malformed
-ports, and non-DNS input are rejected.
+The default proxy resolves the normalized HTTP `Host` or HTTP/2 `:authority`
+value against an exact route. Route names are lowercase ASCII DNS names below
+`.localhost`; IP literals, userinfo, malformed ports, and non-DNS input are
+rejected. A configured route table can select another single-label TLD and can
+opt in to registered-parent fallback as described in
+[proxy-profiles.md](proxy-profiles.md).
 
 Upstreams are absolute `http` or `https` URLs with an explicit IP address and
 port. Only loopback and private unicast addresses are accepted.
 Paths, queries, fragments, credentials, hostnames, unspecified addresses,
-multicast addresses, and public addresses are rejected. Container ownership is
-validated by the Apple-container integration before it registers a route; the
-route package enforces the network and URL boundary but cannot establish
-container identity by itself.
+multicast addresses, and public addresses are rejected. A runtime adapter may
+validate container, VM, or process ownership before it registers a route; the
+route package remains runtime agnostic and enforces the network and URL
+boundary rather than runtime identity.
 
-`routes.Table` supports concurrent exact lookup, add/replace, delete, sorted
-snapshot listing, and whole-table replacement. Route values are immutable and
-whole-table replacements validate before swapping the active map.
+`routes.Table` supports concurrent exact lookup, policy-aware resolution,
+add/replace, delete, sorted snapshot listing, and whole-table replacement.
+Route values are immutable and whole-table replacements validate both the
+upstream and the table's TLD before swapping the active map.
+
+`Lookup` remains exact. `Resolve` checks the exact route first and, only when
+enabled for the table, removes one complete leftmost DNS label at a time until
+it finds the longest registered parent. Resolution stops before the TLD. It
+never scans unrelated suffixes, crosses a TLD boundary, or treats an
+unregistered hostname as a catch-all.
 
 ## Forwarding behavior
 
@@ -25,7 +34,7 @@ query, and streaming body, and recreates these trusted headers after discarding
 client-supplied forwarding data:
 
 - `X-Forwarded-For`: the immediate client IP
-- `X-Forwarded-Host`: the canonical registered route name
+- `X-Forwarded-Host`: the normalized requested public authority
 - `X-Forwarded-Proto`: `http` or `https` from the frontend connection
 
 `Forwarded`, every client-supplied `X-Forwarded-*` field, and `X-Real-IP` are
@@ -34,8 +43,10 @@ not transparently decompress upstream responses, and supports HTTP/1.1 plus
 HTTP/2 over TLS. Streaming responses flush immediately. Backend `Alt-Svc` is
 removed so an internal endpoint cannot advertise itself as the public local
 origin. Absolute and network-path redirects that exactly identify the selected
-upstream endpoint are rewritten to the public route; relative and external
-redirects are preserved.
+upstream endpoint are rewritten to the normalized requested public authority,
+including an explicitly configured non-default port; relative and external
+redirects are preserved. A fallback request retains its requested child
+hostname rather than being rewritten to the registered parent.
 
 Unknown routes return 404, malformed authorities return 400, and `CONNECT`
 returns 405. An outbound hop marker causes a recursive route to terminate with

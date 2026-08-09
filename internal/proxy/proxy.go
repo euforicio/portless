@@ -4,6 +4,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -26,20 +27,25 @@ var ErrNilRoutes = errors.New("proxy requires a route table")
 type Options struct {
 	Transport http.RoundTripper
 	ErrorLog  *log.Logger
+	// PublicPort is the configured frontend port used when rewriting absolute
+	// upstream redirects. Zero preserves the standard port behavior.
+	PublicPort uint16
 }
 
 // Handler is safe for concurrent use. Route changes take effect on the next
 // request without rebuilding the handler.
 type Handler struct {
-	routes *routes.Table
-	proxy  *httputil.ReverseProxy
+	routes     *routes.Table
+	proxy      *httputil.ReverseProxy
+	publicPort uint16
 }
 
 type requestContextKey struct{}
 
 type requestContext struct {
-	route        routes.Route
-	publicScheme string
+	route           routes.Route
+	publicAuthority string
+	publicScheme    string
 }
 
 // New constructs a streaming reverse proxy backed by table.
@@ -68,7 +74,7 @@ func New(table *routes.Table, options Options) (*Handler, error) {
 			}
 			request.Out.Header.Del("X-Real-Ip")
 			request.SetXForwarded()
-			request.Out.Header.Set("X-Forwarded-Host", requestData.route.Host())
+			request.Out.Header.Set("X-Forwarded-Host", requestData.publicAuthority)
 			request.Out.Header.Set(loopHeader, "1")
 		},
 		ModifyResponse: func(response *http.Response) error {
@@ -86,7 +92,7 @@ func New(table *routes.Table, options Options) (*Handler, error) {
 		},
 	}
 
-	return &Handler{routes: table, proxy: reverseProxy}, nil
+	return &Handler{routes: table, proxy: reverseProxy, publicPort: options.PublicPort}, nil
 }
 
 func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -103,18 +109,18 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	authority, err := routes.NormalizeAuthority(request.Host)
+	authority, err := h.routes.NormalizeAuthority(request.Host)
 	if err != nil {
 		http.Error(writer, "invalid host", http.StatusBadRequest)
 		return
 	}
-	route, ok := h.routes.Lookup(authority)
+	route, ok := h.routes.Resolve(authority)
 	if !ok {
 		http.Error(writer, "unknown host", http.StatusNotFound)
 		return
 	}
 
-	ctx := contextWithRoute(request, route)
+	ctx := contextWithRoute(request, route, authority, h.publicPort)
 	h.proxy.ServeHTTP(writer, request.WithContext(ctx))
 }
 
@@ -136,13 +142,21 @@ func newTransport() *http.Transport {
 	return transport
 }
 
-func contextWithRoute(request *http.Request, route routes.Route) context.Context {
+func contextWithRoute(request *http.Request, route routes.Route, publicHost string, publicPort uint16) context.Context {
 	publicScheme := "http"
 	if request.TLS != nil {
 		publicScheme = "https"
 	}
-	value := requestContext{route: route, publicScheme: publicScheme}
+	publicAuthority := publicHost
+	if publicPort != 0 && !isDefaultPort(publicScheme, publicPort) {
+		publicAuthority = fmt.Sprintf("%s:%d", publicHost, publicPort)
+	}
+	value := requestContext{route: route, publicAuthority: publicAuthority, publicScheme: publicScheme}
 	return context.WithValue(request.Context(), requestContextKey{}, value)
+}
+
+func isDefaultPort(scheme string, port uint16) bool {
+	return (scheme == "http" && port == 80) || (scheme == "https" && port == 443)
 }
 
 func rewriteLocation(response *http.Response) {
@@ -162,7 +176,7 @@ func rewriteLocation(response *http.Response) {
 		return
 	}
 	location.Scheme = requestData.publicScheme
-	location.Host = requestData.route.Host()
+	location.Host = requestData.publicAuthority
 	response.Header.Set("Location", location.String())
 }
 
