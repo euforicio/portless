@@ -205,3 +205,85 @@ func TestTableConcurrentAccess(t *testing.T) {
 	}
 	group.Wait()
 }
+
+func TestCustomTLDAndWildcardFallback(t *testing.T) {
+	t.Parallel()
+
+	table, err := routes.NewTableWithOptions(routes.Options{TLD: "DEV", WildcardFallback: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := table.Set("app.dev", "http://127.0.0.1:8000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nearer, err := table.Set("api.app.dev", "http://127.0.0.1:8001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact, err := table.Set("v1.api.app.dev", "http://127.0.0.1:8002")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		authority string
+		want      routes.Route
+		found     bool
+	}{
+		{authority: "v1.api.app.dev:8443", want: exact, found: true},
+		{authority: "child.api.app.dev", want: nearer, found: true},
+		{authority: "deep.child.app.dev", want: parent, found: true},
+		{authority: "missing.dev", found: false},
+		{authority: "app.developer", found: false},
+		{authority: "app.dev.example", found: false},
+		{authority: "dev", found: false},
+		{authority: "child.localhost", found: false},
+	}
+	for _, test := range tests {
+		got, found := table.Resolve(test.authority)
+		if found != test.found || (found && got.Upstream() != test.want.Upstream()) {
+			t.Errorf("Resolve(%q) = (%q, %v), want (%q, %v)", test.authority, got.Upstream(), found, test.want.Upstream(), test.found)
+		}
+	}
+	if _, found := table.Lookup("child.api.app.dev"); found {
+		t.Fatal("Lookup performed wildcard fallback")
+	}
+}
+
+func TestWildcardFallbackIsOptIn(t *testing.T) {
+	t.Parallel()
+
+	table, err := routes.NewTableWithOptions(routes.Options{TLD: ".test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := table.Set("app.test", "http://127.0.0.1:8000"); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := table.Resolve("child.app.test"); found {
+		t.Fatal("exact-only table resolved an unregistered child")
+	}
+}
+
+func TestCustomTLDValidationAndReplacementBoundary(t *testing.T) {
+	t.Parallel()
+
+	for _, invalid := range []string{".", "..test", "dev.local", "-test", "123", "tést", "test:443"} {
+		if _, err := routes.NewTableWithOptions(routes.Options{TLD: invalid}); !errors.Is(err, routes.ErrInvalidTLD) {
+			t.Errorf("NewTableWithOptions(TLD=%q) error = %v, want ErrInvalidTLD", invalid, err)
+		}
+	}
+
+	table, err := routes.NewTableWithOptions(routes.Options{TLD: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := routes.NewRoute("app.localhost", "http://127.0.0.1:8000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Replace([]routes.Route{foreign}); !errors.Is(err, routes.ErrInvalidHost) {
+		t.Fatalf("Replace(foreign route) error = %v, want ErrInvalidHost", err)
+	}
+}

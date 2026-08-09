@@ -16,10 +16,20 @@ import (
 var (
 	ErrInvalidHost     = errors.New("invalid route host")
 	ErrInvalidUpstream = errors.New("invalid route upstream")
+	ErrInvalidTLD      = errors.New("invalid route TLD")
 )
 
-// Route is an immutable mapping from an exact .localhost host to an upstream.
-// Routes must be created with NewRoute.
+const defaultTLD = ".localhost"
+
+// Options defines the host namespace and lookup policy for a route table.
+// The zero value selects exact-only .localhost routing.
+type Options struct {
+	TLD              string
+	WildcardFallback bool
+}
+
+// Route is an immutable mapping from an exact validated host to an upstream.
+// Routes must be created with NewRoute or NewRouteForTLD.
 type Route struct {
 	host     string
 	upstream string
@@ -29,7 +39,12 @@ type Route struct {
 // NewRoute validates and normalizes a route. Upstreams are limited to HTTP(S)
 // URLs with an explicit IP address and port on a local or private network.
 func NewRoute(host, upstream string) (Route, error) {
-	normalizedHost, err := NormalizeAuthority(host)
+	return NewRouteForTLD(host, upstream, defaultTLD)
+}
+
+// NewRouteForTLD validates and normalizes a route in the selected DNS suffix.
+func NewRouteForTLD(host, upstream, tld string) (Route, error) {
+	normalizedHost, err := NormalizeAuthorityForTLD(host, tld)
 	if err != nil {
 		return Route{}, err
 	}
@@ -62,6 +77,16 @@ func (r Route) valid() bool {
 // NormalizeAuthority normalizes an HTTP Host or HTTP/2 :authority value to an
 // exact .localhost route name. An optional numeric port is ignored for lookup.
 func NormalizeAuthority(authority string) (string, error) {
+	return NormalizeAuthorityForTLD(authority, defaultTLD)
+}
+
+// NormalizeAuthorityForTLD normalizes an HTTP Host or HTTP/2 :authority value
+// within tld. An optional numeric port is ignored for lookup.
+func NormalizeAuthorityForTLD(authority, tld string) (string, error) {
+	suffix, err := NormalizeTLD(tld)
+	if err != nil {
+		return "", err
+	}
 	if authority == "" || strings.ContainsAny(authority, " \t\r\n/?#@\\") {
 		return "", ErrInvalidHost
 	}
@@ -81,7 +106,7 @@ func NormalizeAuthority(authority string) (string, error) {
 	}
 
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if len(host) > 253 || !strings.HasSuffix(host, ".localhost") {
+	if len(host) > 253 || !strings.HasSuffix(host, suffix) || host == strings.TrimPrefix(suffix, ".") {
 		return "", ErrInvalidHost
 	}
 
@@ -92,6 +117,33 @@ func NormalizeAuthority(authority string) (string, error) {
 	}
 
 	return host, nil
+}
+
+// NormalizeTLD validates and returns a lowercase, dot-prefixed DNS suffix.
+// A profile TLD is one ASCII DNS label; route names must include at least one
+// label before it.
+func NormalizeTLD(tld string) (string, error) {
+	if tld == "" {
+		tld = defaultTLD
+	}
+	if strings.ContainsAny(tld, " \t\r\n/?#@\\:") {
+		return "", ErrInvalidTLD
+	}
+	label := strings.ToLower(strings.TrimPrefix(strings.TrimSuffix(tld, "."), "."))
+	if !validDNSLabel(label) || strings.Contains(label, ".") {
+		return "", ErrInvalidTLD
+	}
+	hasLetter := false
+	for _, character := range label {
+		if character >= 'a' && character <= 'z' {
+			hasLetter = true
+			break
+		}
+	}
+	if !hasLetter {
+		return "", ErrInvalidTLD
+	}
+	return "." + label, nil
 }
 
 func validDNSLabel(label string) bool {
@@ -155,17 +207,33 @@ func parseUpstream(raw string) (url.URL, string, error) {
 
 // Table stores routes. Every mutation becomes visible atomically to readers.
 type Table struct {
-	mu     sync.RWMutex
-	routes map[string]Route
+	mu               sync.RWMutex
+	routes           map[string]Route
+	tld              string
+	wildcardFallback bool
 }
 
 func NewTable() *Table {
-	return &Table{routes: make(map[string]Route)}
+	return &Table{routes: make(map[string]Route), tld: defaultTLD}
+}
+
+// NewTableWithOptions constructs a table with an explicit host namespace and
+// fallback policy.
+func NewTableWithOptions(options Options) (*Table, error) {
+	tld, err := NormalizeTLD(options.TLD)
+	if err != nil {
+		return nil, err
+	}
+	return &Table{
+		routes:           make(map[string]Route),
+		tld:              tld,
+		wildcardFallback: options.WildcardFallback,
+	}, nil
 }
 
 // Set validates and atomically adds or replaces one route.
 func (t *Table) Set(host, upstream string) (Route, error) {
-	route, err := NewRoute(host, upstream)
+	route, err := NewRouteForTLD(host, upstream, t.options().TLD)
 	if err != nil {
 		return Route{}, err
 	}
@@ -185,6 +253,9 @@ func (t *Table) Replace(replacement []Route) error {
 		if !route.valid() {
 			return ErrInvalidUpstream
 		}
+		if _, err := NormalizeAuthorityForTLD(route.host, t.options().TLD); err != nil {
+			return err
+		}
 		if _, exists := next[route.host]; exists {
 			return fmt.Errorf("%w: duplicate %q", ErrInvalidHost, route.host)
 		}
@@ -199,7 +270,7 @@ func (t *Table) Replace(replacement []Route) error {
 
 // Delete removes a route by normalized host or authority.
 func (t *Table) Delete(authority string) bool {
-	host, err := NormalizeAuthority(authority)
+	host, err := t.NormalizeAuthority(authority)
 	if err != nil {
 		return false
 	}
@@ -212,7 +283,7 @@ func (t *Table) Delete(authority string) bool {
 
 // Lookup performs an exact normalized host lookup.
 func (t *Table) Lookup(authority string) (Route, bool) {
-	host, err := NormalizeAuthority(authority)
+	host, err := t.NormalizeAuthority(authority)
 	if err != nil {
 		return Route{}, false
 	}
@@ -220,6 +291,61 @@ func (t *Table) Lookup(authority string) (Route, bool) {
 	route, ok := t.routes[host]
 	t.mu.RUnlock()
 	return route, ok
+}
+
+// Resolve performs exact lookup first. When wildcard fallback is enabled it
+// then checks each registered parent, from longest to shortest, without ever
+// crossing the table's TLD boundary.
+func (t *Table) Resolve(authority string) (Route, bool) {
+	host, err := t.NormalizeAuthority(authority)
+	if err != nil {
+		return Route{}, false
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if route, ok := t.routes[host]; ok {
+		return route, true
+	}
+	if !t.wildcardFallback {
+		return Route{}, false
+	}
+
+	minimum := strings.TrimPrefix(t.tldValue(), ".")
+	for candidate := host; ; {
+		separator := strings.IndexByte(candidate, '.')
+		if separator < 0 {
+			return Route{}, false
+		}
+		candidate = candidate[separator+1:]
+		if candidate == minimum {
+			return Route{}, false
+		}
+		if route, ok := t.routes[candidate]; ok {
+			return route, true
+		}
+	}
+}
+
+// NormalizeAuthority applies this table's configured TLD policy.
+func (t *Table) NormalizeAuthority(authority string) (string, error) {
+	return NormalizeAuthorityForTLD(authority, t.options().TLD)
+}
+
+// Options returns the immutable table policy.
+func (t *Table) Options() Options { return t.options() }
+
+func (t *Table) options() Options {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return Options{TLD: t.tldValue(), WildcardFallback: t.wildcardFallback}
+}
+
+func (t *Table) tldValue() string {
+	if t.tld == "" {
+		return defaultTLD
+	}
+	return t.tld
 }
 
 // List returns an immutable host-sorted route snapshot.

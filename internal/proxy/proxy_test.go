@@ -835,3 +835,75 @@ func TestHTTPSUpstreamUsesConfiguredTrust(t *testing.T) {
 		t.Fatalf("HTTPS upstream body = %q", got)
 	}
 }
+
+func TestCustomTLDFallbackExactWinsAndPreservesPublicOrigin(t *testing.T) {
+	t.Parallel()
+
+	type received struct {
+		backend string
+		host    string
+	}
+	requests := make(chan received, 3)
+	var parentURL string
+	parent := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests <- received{backend: "parent", host: request.Header.Get("X-Forwarded-Host")}
+		if request.URL.Path == "/redirect" {
+			writer.Header().Set("Location", parentURL+"/login")
+			writer.WriteHeader(http.StatusFound)
+			return
+		}
+		_, _ = io.WriteString(writer, "parent")
+	}))
+	parentURL = parent.URL
+	t.Cleanup(parent.Close)
+	exact := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests <- received{backend: "exact", host: request.Header.Get("X-Forwarded-Host")}
+		_, _ = io.WriteString(writer, "exact")
+	}))
+	t.Cleanup(exact.Close)
+
+	table, err := routes.NewTableWithOptions(routes.Options{TLD: "test", WildcardFallback: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSetRoute(t, table, "app.test", parent.URL)
+	mustSetRoute(t, table, "exact.app.test", exact.URL)
+	frontend := httptest.NewTLSServer(mustNewProxy(t, table, proxy.Options{PublicPort: 8443}))
+	t.Cleanup(frontend.Close)
+	client := frontend.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	if got := requestBody(t, client, frontend.URL, "child.app.test:8443"); got != "parent" {
+		t.Fatalf("fallback body = %q, want parent", got)
+	}
+	if got := <-requests; got.backend != "parent" || got.host != "child.app.test:8443" {
+		t.Fatalf("fallback request = %#v", got)
+	}
+	if got := requestBody(t, client, frontend.URL, "exact.app.test:8443"); got != "exact" {
+		t.Fatalf("exact body = %q, want exact", got)
+	}
+	if got := <-requests; got.backend != "exact" || got.host != "exact.app.test:8443" {
+		t.Fatalf("exact request = %#v", got)
+	}
+
+	response := makeRequest(t, client, frontend.URL+"/redirect", "deep.app.test:8443", http.MethodGet)
+	response.Body.Close()
+	if response.StatusCode != http.StatusFound || response.Header.Get("Location") != "https://deep.app.test:8443/login" {
+		t.Fatalf("fallback redirect = %d %q", response.StatusCode, response.Header.Get("Location"))
+	}
+	if got := <-requests; got.backend != "parent" || got.host != "deep.app.test:8443" {
+		t.Fatalf("redirect request = %#v", got)
+	}
+
+	for host, want := range map[string]int{
+		"missing.test:8443":  http.StatusNotFound,
+		"app.localhost:8443": http.StatusBadRequest,
+		"app.test.example":   http.StatusBadRequest,
+	} {
+		response := makeRequest(t, client, frontend.URL, host, http.MethodGet)
+		response.Body.Close()
+		if response.StatusCode != want {
+			t.Errorf("host %q status = %d, want %d", host, response.StatusCode, want)
+		}
+	}
+}
