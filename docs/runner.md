@@ -75,6 +75,12 @@ runtime inference. It is injected only for a proxied run when the caller
 explicitly supplies an absolute, real CA certificate file. The runner never
 examines argv to guess a runtime.
 
+`--lan` does not change the child's `HOST`, `PORT`, or `PORTLESS_URL`; the
+application remains on loopback and the local `.localhost` origin stays its
+primary injected origin. Portless starts a separate selected-interface reverse
+proxy and prints its `.local` URL. LAN HTTP is the default; `--https` adds an
+exact-host certificate and an explicit remote-client trust requirement.
+
 ## Supervision and identity safety
 
 Every child has `PGID == PID`. Darwin process inspection records PID, process
@@ -113,6 +119,11 @@ classifies them as:
 Unknown kernel inspection errors fail closed. `Prune` removes only definitely
 stale records and never signals a process. A live orphan remains discoverable
 for an explicit, identity-checked takeover.
+
+LAN ownership is stored separately from runner records. It includes only the
+exact advertisement PID/start identity and listener metadata needed for crash
+reconciliation. Once `Prune` proves the runner stale, it terminates that exact
+advertisement and removes the owned LAN record before cleaning the route.
 
 `ForceTakeover` requires a complete, currently observed process-owned
 `client.Route`. It verifies the canonical route name, endpoint host and port,

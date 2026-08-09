@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,6 +40,11 @@ type Options struct {
 	RootValidity   time.Duration
 	LeafValidity   time.Duration
 	RenewBefore    time.Duration
+	// MaxLeafCertificates bounds the exact-host leaf cache in memory and on
+	// disk. Zero preserves the existing unbounded behavior. A positive limit
+	// is appropriate for authorities whose accepted host set can change, such
+	// as an explicitly enabled LAN authority.
+	MaxLeafCertificates int
 	// AllowHost is called with the normalized exact hostname before issuance.
 	// It should read a concurrency-safe route snapshot. Nil permits any valid
 	// hostname under AllowedSuffix.
@@ -105,6 +111,9 @@ func Open(dir string, options Options) (*Authority, error) {
 		return nil, err
 	}
 	if err := a.writePublicRoot(); err != nil {
+		return nil, err
+	}
+	if err := a.enforceLeafBound(""); err != nil {
 		return nil, err
 	}
 	return a, nil
@@ -252,6 +261,10 @@ func (a *Authority) Certificate(host string) (*tls.Certificate, error) {
 		}
 		if cert, parseErr := parseLeaf(bundle, host, a.root); parseErr == nil && usableLeaf(cert, host, a.root, a.rootID, now, a.options.RenewBefore) {
 			a.leafBySN[host] = cert
+			if err := a.enforceLeafBound(host); err != nil {
+				delete(a.leafBySN, host)
+				return nil, err
+			}
 			return cert, nil
 		}
 	} else if !errors.Is(readErr, os.ErrNotExist) {
@@ -266,7 +279,93 @@ func (a *Authority) Certificate(host string) (*tls.Certificate, error) {
 		return nil, fmt.Errorf("write leaf certificate: %w", err)
 	}
 	a.leafBySN[host] = cert
+	if err := a.enforceLeafBound(host); err != nil {
+		delete(a.leafBySN, host)
+		removeErr := os.Remove(path)
+		if removeErr == nil {
+			removeErr = syncDirectory(filepath.Dir(path))
+		}
+		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return nil, errors.Join(err, fmt.Errorf("remove unbounded leaf certificate: %w", removeErr))
+		}
+		return nil, err
+	}
 	return cert, nil
+}
+
+type leafCacheEntry struct {
+	host    string
+	path    string
+	modTime time.Time
+}
+
+// enforceLeafBound reconciles the owned leaf directory with the configured
+// limit. keepHost is evicted last so successful issuance never returns a
+// certificate that the bounded cache immediately discarded.
+func (a *Authority) enforceLeafBound(keepHost string) error {
+	limit := a.options.MaxLeafCertificates
+	if limit == 0 {
+		return nil
+	}
+	dir := filepath.Join(a.dir, leafDirName)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read leaf certificate cache: %w", err)
+	}
+	leaves := make([]leafCacheEntry, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		path := filepath.Join(dir, name)
+		if entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(name, ".pem") {
+			return fmt.Errorf("unsafe entry in leaf certificate cache: %s", path)
+		}
+		host := strings.TrimSuffix(name, ".pem")
+		normalized, normalizeErr := normalizeHost(host, a.options.AllowedSuffix)
+		if normalizeErr != nil || normalized != host {
+			return fmt.Errorf("unsafe entry in leaf certificate cache: %s", path)
+		}
+		if err := checkRegularFile(path, 0o600); err != nil {
+			return fmt.Errorf("unsafe leaf certificate cache entry: %w", err)
+		}
+		bundle, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read leaf certificate cache entry %s: %w", path, err)
+		}
+		if _, err := parseLeaf(bundle, host, a.root); err != nil {
+			return fmt.Errorf("invalid leaf certificate cache entry %s: %w", path, err)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("inspect leaf certificate cache entry %s: %w", path, err)
+		}
+		leaves = append(leaves, leafCacheEntry{host: host, path: path, modTime: info.ModTime()})
+	}
+	if len(leaves) <= limit {
+		return nil
+	}
+	sort.Slice(leaves, func(i, j int) bool {
+		if leaves[i].host == keepHost {
+			return false
+		}
+		if leaves[j].host == keepHost {
+			return true
+		}
+		if !leaves[i].modTime.Equal(leaves[j].modTime) {
+			return leaves[i].modTime.Before(leaves[j].modTime)
+		}
+		return leaves[i].host < leaves[j].host
+	})
+	removeCount := len(leaves) - limit
+	for _, leaf := range leaves[:removeCount] {
+		if err := os.Remove(leaf.path); err != nil {
+			return fmt.Errorf("evict leaf certificate %q: %w", leaf.host, err)
+		}
+		delete(a.leafBySN, leaf.host)
+	}
+	if err := syncDirectory(dir); err != nil {
+		return fmt.Errorf("persist leaf certificate eviction: %w", err)
+	}
+	return nil
 }
 
 func normalizeOptions(options Options) (Options, error) {
@@ -294,6 +393,9 @@ func normalizeOptions(options Options) (Options, error) {
 	}
 	if options.RootValidity <= 0 || options.LeafValidity <= 0 || options.RenewBefore < 0 {
 		return Options{}, errors.New("certificate lifetimes must be positive and renew-before non-negative")
+	}
+	if options.MaxLeafCertificates < 0 {
+		return Options{}, errors.New("maximum leaf certificates must be non-negative")
 	}
 	if options.LeafValidity > options.RootValidity {
 		return Options{}, errors.New("leaf validity cannot exceed root validity")
@@ -598,6 +700,10 @@ func atomicWrite(path string, contents []byte, mode os.FileMode) error {
 	if err := os.Chmod(path, mode); err != nil {
 		return err
 	}
+	return syncDirectory(dir)
+}
+
+func syncDirectory(dir string) error {
 	directory, err := os.Open(dir)
 	if err != nil {
 		return err

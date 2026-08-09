@@ -54,9 +54,23 @@ an exact live runner record and uses protocol compare-and-set replacement.
 `--tailscale` and `--funnel` are explicit per-run exposure boundaries. They use
 the official CLI's live capabilities, apply one root-mounted registration, and
 remove only that exact registration when the run ends. They never use `sudo`.
-`--lan` currently fails closed: the mDNS foundation is implemented and tested,
-but advertising a `.local` HTTPS name without a matching certificate and LAN
-listener would be misleading and insecure.
+`--lan` explicitly adds a host-level plain-HTTP listener on one eligible LAN
+address and advertises the exact route as `.local`. It never depends on a
+container runtime, wildcard-binds, or persists as a default. `--ip` pins one
+eligible assigned address; otherwise Portless selects deterministically and
+tracks interface/address changes. `--lan --https` enables exact-host TLS with a
+bounded local-CA leaf cache. Other devices do not automatically trust the Mac's
+CA; Portless prints the public CA path for explicit client trust.
+
+```sh
+portless run --name fieldnotes --lan -- go run ./cmd/server
+portless run --name fieldnotes --lan --ip 192.168.1.20 -- go run ./cmd/server
+portless run --name fieldnotes --lan --https -- go run ./cmd/server
+```
+
+LAN listeners use an OS-assigned unprivileged port, shown in the printed URL.
+They expose the application to subnet peers without access control. The local
+`.localhost` origin remains available simultaneously on the loopback daemon.
 
 Example `portless.json`:
 
@@ -103,6 +117,8 @@ allowed only after every route has been removed.
 ## Safety boundaries and intentional exclusions
 
 - Default listeners are literal loopback addresses only.
+- LAN activates only through the explicit per-run `--lan` flag; configuration
+  files and environment variables cannot silently enable it.
 - Routine run, alias, list, remove, refresh, prune, Serve, and Funnel operations
   never invoke `sudo`.
 - Trust, LaunchDaemon, privileged ports, `/etc/hosts`, and destructive route
@@ -114,6 +130,9 @@ allowed only after every route has been removed.
 - Tailscale registrations are durably tied to the runner identity, cleaned
   exactly on normal and signaled shutdown, and reconciled after a hard crash by
   `portless prune` or the confirmed `portless clean --routes --yes` boundary.
+- LAN advertisement identities are also tied to the runner identity. Cleanup
+  stops only the exact owned `dns-sd` process; Portless never changes firewall
+  or DNS configuration, `/etc/hosts`, or unrelated `dns-sd` processes.
 
 See [CLI](docs/cli.md), [architecture](docs/architecture.md),
 [profiles](docs/proxy-profiles.md), [runner](docs/runner.md),

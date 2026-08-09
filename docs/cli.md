@@ -7,7 +7,8 @@ portless init [--management-group GROUP]
               [--scheme http|https] [--listen LOOPBACK:PORT] [--tld TLD]
               [--cert FILE --key FILE] [--wildcard]
 portless run [--name NAME] [--app-port PORT] [--force]
-             [--lan] [--tailscale|--funnel] -- COMMAND [ARGS...]
+             [--lan [--https] [--ip ADDRESS]]
+             [--tailscale|--funnel] -- COMMAND [ARGS...]
 portless NAME COMMAND [ARGS...]
 portless
 portless alias|add NAME --host IP --port PORT [--protocol http|https] [--force]
@@ -97,6 +98,17 @@ reinterpretation. HTTP or certificate-file profiles remove unused generated-CA
 trust and child metadata; generated-CA profiles install them.
 
 Tailscale Serve/Funnel run flags perform live read-only preflight, exact apply,
-verification, and exact cleanup. `--lan` fails closed until Portless can pair
-the existing real `dns-sd` publisher with an eligible LAN listener and a
-certificate valid for the advertised `.local` name.
+verification, and exact cleanup. `--lan` is a per-run, explicit host-level
+boundary and defaults to HTTP. It binds one selected private-unicast address on
+an OS-assigned unprivileged port, publishes the exact `.local` route through
+`dns-sd`, and leaves the daemon's loopback `.localhost` origin active. `--ip`
+pins one currently eligible address; without it selection is deterministic and
+tracks interface changes. `--https` is valid only with `--lan` and uses an exact
+`.local` leaf from the bounded LAN CA cache. Portless prints the CA path and
+does not claim or attempt to install trust on other devices.
+
+No project configuration key or environment variable enables LAN. LAN never
+binds a wildcard address, invokes `sudo`, changes firewall or DNS settings, or
+edits `/etc/hosts`. There is no routine LAN-port flag: LAN uses an unprivileged
+ephemeral port. Ports 80/443 remain inside the explicit installed-service
+privilege boundary.

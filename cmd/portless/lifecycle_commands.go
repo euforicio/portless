@@ -21,6 +21,7 @@ import (
 
 	"github.com/euforicio/portless/internal/client"
 	"github.com/euforicio/portless/internal/hosts"
+	"github.com/euforicio/portless/internal/mdns"
 	"github.com/euforicio/portless/internal/pki"
 	"github.com/euforicio/portless/internal/profile"
 	"github.com/euforicio/portless/internal/routes"
@@ -538,8 +539,25 @@ func pruneCommand(ctx context.Context, management client.Client, args []string, 
 		return err
 	}
 	cleanedShares := 0
+	lanExposures, err := ownedLANExposures()
+	if err != nil {
+		return err
+	}
+	cleanedLAN := 0
 	sharingClient := tailscale.Client{}
 	for _, stale := range removed {
+		for _, exposure := range lanExposures {
+			if exposure.Identity != stale.Identity {
+				continue
+			}
+			if err := mdns.StopOwned(exposure.Registration.MDNS); err != nil {
+				return fmt.Errorf("clean stale LAN advertisement %s: %w", exposure.Registration.Name, err)
+			}
+			if err := removeOwnedLAN(exposure.Identity, exposure.Registration.Name); err != nil {
+				return err
+			}
+			cleanedLAN++
+		}
 		for _, share := range shares {
 			if share.Identity != stale.Identity {
 				continue
@@ -558,7 +576,7 @@ func pruneCommand(ctx context.Context, management client.Client, args []string, 
 			_ = cleanupRoute(ctx, management, route)
 		}
 	}
-	fmt.Fprintf(stdout, "pruned %d stale runner records and %d shares\n", len(removed), cleanedShares)
+	fmt.Fprintf(stdout, "pruned %d stale runner records, %d LAN exposures, and %d Tailscale shares\n", len(removed), cleanedLAN, cleanedShares)
 	return nil
 }
 
@@ -585,6 +603,18 @@ func cleanCommand(ctx context.Context, management client.Client, args []string, 
 		return err
 	}
 	sharingClient := tailscale.Client{}
+	lanExposures, err := ownedLANExposures()
+	if err != nil {
+		return err
+	}
+	for _, exposure := range lanExposures {
+		if err := mdns.StopOwned(exposure.Registration.MDNS); err != nil {
+			return fmt.Errorf("clean LAN advertisement %s: %w", exposure.Registration.Name, err)
+		}
+		if err := removeOwnedLAN(exposure.Identity, exposure.Registration.Name); err != nil {
+			return err
+		}
+	}
 	for _, share := range shares {
 		if err := sharingClient.Clean(ctx, share.Plan); err != nil {
 			return fmt.Errorf("clean Tailscale share %s: %w", share.Plan.Registration.Name, err)
@@ -598,6 +628,6 @@ func cleanCommand(ctx context.Context, management client.Client, args []string, 
 			return err
 		}
 	}
-	fmt.Fprintf(stdout, "removed %d routes and %d shares\n", len(response.Routes), len(shares))
+	fmt.Fprintf(stdout, "removed %d routes, %d LAN exposures, and %d Tailscale shares\n", len(response.Routes), len(lanExposures), len(shares))
 	return nil
 }

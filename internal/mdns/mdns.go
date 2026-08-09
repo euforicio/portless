@@ -1,4 +1,4 @@
-// Package mdns publishes explicit HTTPS names on a local network through the
+// Package mdns publishes explicit HTTP or HTTPS names on a local network through the
 // macOS dns-sd utility. Publishing is always an explicit caller action.
 package mdns
 
@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,13 +32,21 @@ var (
 	ErrNotRunning     = errors.New("mDNS advertisement is not running")
 )
 
-// Config describes one root-mounted HTTPS advertisement. Host must be one
-// exact, single-label .local name and Address must currently belong to an up,
+type Protocol string
+
+const (
+	HTTP  Protocol = "http"
+	HTTPS Protocol = "https"
+)
+
+// Config describes one root-mounted HTTP or HTTPS advertisement. Host must be
+// one exact .local name and Address must currently belong to an up,
 // multicast-capable, non-point-to-point interface.
 type Config struct {
 	Host         string
 	Address      netip.Addr
 	Port         uint16
+	Protocol     Protocol
 	ReadyTimeout time.Duration
 }
 
@@ -59,7 +68,66 @@ func (c Command) String() string {
 type Preflight struct {
 	Config    Config
 	Interface string
+	Index     int
 	Command   Command
+}
+
+type LANAddress struct {
+	Address   netip.Addr
+	Interface string
+	Index     int
+}
+
+// EligibleAddresses returns the deterministic LAN selection set. Interface
+// index is the primary stable order, IPv4 is preferred to ULA IPv6, then the
+// canonical address bytes break ties.
+func EligibleAddresses() ([]LANAddress, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("list network interfaces: %w", err)
+	}
+	var result []LANAddress
+	for _, networkInterface := range interfaces {
+		required := net.FlagUp | net.FlagMulticast
+		if networkInterface.Flags&required != required || networkInterface.Flags&(net.FlagLoopback|net.FlagPointToPoint) != 0 {
+			continue
+		}
+		addresses, err := networkInterface.Addrs()
+		if err != nil {
+			return nil, fmt.Errorf("list addresses for %s: %w", networkInterface.Name, err)
+		}
+		for _, raw := range addresses {
+			prefix, err := netip.ParsePrefix(raw.String())
+			if err != nil {
+				continue
+			}
+			address := prefix.Addr().Unmap()
+			if !address.IsValid() || address.Zone() != "" || !address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsMulticast() || address.IsUnspecified() {
+				continue
+			}
+			result = append(result, LANAddress{Address: address, Interface: networkInterface.Name, Index: networkInterface.Index})
+		}
+	}
+	slices.SortFunc(result, func(a, b LANAddress) int {
+		if a.Index != b.Index {
+			return a.Index - b.Index
+		}
+		if a.Address.Is4() != b.Address.Is4() {
+			if a.Address.Is4() {
+				return -1
+			}
+			return 1
+		}
+		return a.Address.Compare(b.Address)
+	})
+	return result, nil
+}
+
+// Identity is the kernel start identity of the owned dns-sd process. It is
+// durable crash-reconciliation metadata; a PID alone is never sufficient.
+type Identity struct {
+	PID   int   `json:"pid"`
+	Start int64 `json:"start"`
 }
 
 // Check validates an advertisement against the current network interfaces and
@@ -73,9 +141,15 @@ func Check(config Config) (Preflight, error) {
 		return Preflight{}, errors.New("mDNS advertisement port is required")
 	}
 	address := config.Address.Unmap()
-	interfaceName, err := LANInterface(address)
+	networkInterface, err := lanInterface(address)
 	if err != nil {
 		return Preflight{}, err
+	}
+	if config.Protocol == "" {
+		config.Protocol = HTTPS
+	}
+	if config.Protocol != HTTP && config.Protocol != HTTPS {
+		return Preflight{}, errors.New("mDNS advertisement protocol must be http or https")
 	}
 	if config.ReadyTimeout < 0 {
 		return Preflight{}, errors.New("mDNS readiness timeout cannot be negative")
@@ -86,25 +160,33 @@ func Check(config Config) (Preflight, error) {
 	command := Command{
 		Path: Executable,
 		Args: []string{
-			"-P", instance, "_https._tcp", "local.",
+			"-i", strconv.Itoa(networkInterface.Index), "-P", instance, "_" + string(config.Protocol) + "._tcp", "local.",
 			strconv.FormatUint(uint64(config.Port), 10), host + ".", address.String(), "path=/",
 		},
 	}
-	return Preflight{Config: config, Interface: interfaceName, Command: command}, nil
+	return Preflight{Config: config, Interface: networkInterface.Name, Index: networkInterface.Index, Command: command}, nil
 }
 
 // LANInterface returns the interface currently owning address. It rejects
 // loopback, link-local, public, multicast, unspecified, and point-to-point
 // addresses so VPN and tailnet addresses cannot accidentally become LAN mode.
 func LANInterface(address netip.Addr) (string, error) {
+	networkInterface, err := lanInterface(address)
+	if err != nil {
+		return "", err
+	}
+	return networkInterface.Name, nil
+}
+
+func lanInterface(address netip.Addr) (net.Interface, error) {
 	address = address.Unmap()
 	if !address.IsValid() || address.Zone() != "" || !address.IsPrivate() || address.IsLoopback() ||
 		address.IsLinkLocalUnicast() || address.IsMulticast() || address.IsUnspecified() {
-		return "", fmt.Errorf("%w: %q is not private unicast", ErrInvalidAddress, address)
+		return net.Interface{}, fmt.Errorf("%w: %q is not private unicast", ErrInvalidAddress, address)
 	}
 	interfaces, err := net.Interfaces()
 	if err != nil {
-		return "", fmt.Errorf("list network interfaces: %w", err)
+		return net.Interface{}, fmt.Errorf("list network interfaces: %w", err)
 	}
 	for _, networkInterface := range interfaces {
 		required := net.FlagUp | net.FlagMulticast
@@ -113,16 +195,16 @@ func LANInterface(address netip.Addr) (string, error) {
 		}
 		addresses, addressErr := networkInterface.Addrs()
 		if addressErr != nil {
-			return "", fmt.Errorf("list addresses for %s: %w", networkInterface.Name, addressErr)
+			return net.Interface{}, fmt.Errorf("list addresses for %s: %w", networkInterface.Name, addressErr)
 		}
 		for _, assigned := range addresses {
 			prefix, parseErr := netip.ParsePrefix(assigned.String())
 			if parseErr == nil && prefix.Addr().Unmap() == address {
-				return networkInterface.Name, nil
+				return networkInterface, nil
 			}
 		}
 	}
-	return "", fmt.Errorf("%w: %s is not assigned to an eligible interface", ErrInvalidAddress, address)
+	return net.Interface{}, fmt.Errorf("%w: %s is not assigned to an eligible interface", ErrInvalidAddress, address)
 }
 
 // Publisher owns one dns-sd child process.
@@ -133,6 +215,7 @@ type Publisher struct {
 	command       Command
 	process       *exec.Cmd
 	done          chan error
+	identity      Identity
 	closed        bool
 }
 
@@ -151,6 +234,7 @@ func start(ctx context.Context, preflight Preflight) (*Publisher, error) {
 		return nil, err
 	}
 	command := exec.Command(preflight.Command.Path, preflight.Command.Args...)
+	command.Env = stableEnvironment()
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("capture dns-sd output: %w", err)
@@ -159,9 +243,15 @@ func start(ctx context.Context, preflight Preflight) (*Publisher, error) {
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start dns-sd: %w", err)
 	}
+	identity, err := inspectIdentity(command.Process.Pid)
+	if err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return nil, fmt.Errorf("inspect dns-sd identity: %w", err)
+	}
 	publisher := &Publisher{
 		config: preflight.Config, interfaceName: preflight.Interface,
-		command: preflight.Command, process: command, done: make(chan error, 1),
+		command: preflight.Command, process: command, done: make(chan error, 1), identity: identity,
 	}
 	go func() { publisher.done <- command.Wait() }()
 
@@ -179,27 +269,17 @@ func start(ctx context.Context, preflight Preflight) (*Publisher, error) {
 }
 
 func waitReady(ctx context.Context, output io.Reader, done chan error) error {
-	recordReady := false
-	serviceReady := false
-	lines := make(chan string)
-	scanDone := make(chan error, 1)
+	ready := make(chan error, 1)
 	go func() {
 		scanner := bufio.NewScanner(output)
+		recordReady := false
+		serviceReady := false
+		reported := false
 		for scanner.Scan() {
-			select {
-			case lines <- scanner.Text():
-			case <-ctx.Done():
-				scanDone <- ctx.Err()
+			line := scanner.Text()
+			if !reported && strings.Contains(line, "Name Conflict") {
+				ready <- errors.New("dns-sd reported a name conflict")
 				return
-			}
-		}
-		scanDone <- scanner.Err()
-	}()
-	for {
-		select {
-		case line := <-lines:
-			if strings.Contains(line, "Name Conflict") {
-				return errors.New("dns-sd reported a name conflict")
 			}
 			if strings.Contains(line, "Got a reply for record") && strings.Contains(line, "Name now registered and active") {
 				recordReady = true
@@ -207,23 +287,30 @@ func waitReady(ctx context.Context, output io.Reader, done chan error) error {
 			if strings.Contains(line, "Got a reply for service") && strings.Contains(line, "Name now registered and active") {
 				serviceReady = true
 			}
-			if recordReady && serviceReady {
-				return nil
+			if !reported && recordReady && serviceReady {
+				reported = true
+				ready <- nil
 			}
-		case err := <-done:
-			done <- err
-			if err == nil {
-				return errors.New("dns-sd exited before readiness")
-			}
-			return fmt.Errorf("dns-sd exited before readiness: %w", err)
-		case err := <-scanDone:
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("read dns-sd output: %w", err)
-			}
-			return errors.New("dns-sd output closed before readiness")
-		case <-ctx.Done():
-			return fmt.Errorf("wait for dns-sd readiness: %w", ctx.Err())
 		}
+		if !reported {
+			if err := scanner.Err(); err != nil {
+				ready <- fmt.Errorf("read dns-sd output: %w", err)
+			} else {
+				ready <- errors.New("dns-sd output closed before readiness")
+			}
+		}
+	}()
+	select {
+	case err := <-ready:
+		return err
+	case err := <-done:
+		done <- err
+		if err == nil {
+			return errors.New("dns-sd exited before readiness")
+		}
+		return fmt.Errorf("dns-sd exited before readiness: %w", err)
+	case <-ctx.Done():
+		return fmt.Errorf("wait for dns-sd readiness: %w", ctx.Err())
 	}
 }
 
@@ -239,6 +326,12 @@ func (p *Publisher) Interface() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.interfaceName
+}
+
+func (p *Publisher) Identity() Identity {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.identity
 }
 
 // Command returns a copy of the active command plan.
@@ -281,7 +374,74 @@ func (p *Publisher) Refresh(ctx context.Context, address netip.Addr) (bool, erro
 	p.command = replacement.command
 	p.process = replacement.process
 	p.done = replacement.done
+	p.identity = replacement.identity
 	return true, nil
+}
+
+// StopOwned terminates a previously persisted dns-sd process only when its
+// current kernel start identity still matches. It is used after a supervisor
+// crash and never searches for or affects unrelated dns-sd processes.
+func StopOwned(identity Identity) error {
+	if identity.PID <= 0 || identity.Start <= 0 {
+		return nil
+	}
+	current, err := inspectIdentity(identity.PID)
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if current != identity {
+		return errors.New("dns-sd process identity changed")
+	}
+	if err := syscall.Kill(identity.PID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	deadline := time.Now().Add(stopTimeout)
+	for time.Now().Before(deadline) {
+		_, err := inspectIdentity(identity.PID)
+		if errors.Is(err, os.ErrProcessDone) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	current, err = inspectIdentity(identity.PID)
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	if err != nil || current != identity {
+		return err
+	}
+	if err := syscall.Kill(identity.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	deadline = time.Now().Add(stopTimeout)
+	for time.Now().Before(deadline) {
+		_, err := inspectIdentity(identity.PID)
+		if errors.Is(err, os.ErrProcessDone) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return errors.New("owned dns-sd process did not exit after SIGKILL")
+}
+
+func stableEnvironment() []string {
+	environment := make([]string, 0, len(os.Environ())+2)
+	for _, value := range os.Environ() {
+		if strings.HasPrefix(value, "LANG=") || strings.HasPrefix(value, "LC_ALL=") {
+			continue
+		}
+		environment = append(environment, value)
+	}
+	return append(environment, "LANG=C", "LC_ALL=C")
 }
 
 // Close removes the advertisement. It is safe to call more than once.
@@ -301,10 +461,7 @@ func (p *Publisher) stop() error {
 	}
 	if err := p.process.Process.Signal(syscall.SIGTERM); errors.Is(err, os.ErrProcessDone) {
 		waitErr := <-p.done
-		if waitErr != nil {
-			return fmt.Errorf("dns-sd stopped unexpectedly: %w", waitErr)
-		}
-		return nil
+		return normalizeWait(waitErr)
 	} else if err != nil {
 		select {
 		case waitErr := <-p.done:
@@ -336,14 +493,19 @@ func normalizeWait(err error) error {
 
 func normalizeHost(host string) (string, error) {
 	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	label, ok := strings.CutSuffix(host, ".local")
-	if !ok || label == "" || strings.Contains(label, ".") || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+	prefix, ok := strings.CutSuffix(host, ".local")
+	if !ok || prefix == "" || len(host) > 253 {
 		return "", ErrInvalidHost
 	}
-	for _, character := range label {
-		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+	for label := range strings.SplitSeq(prefix, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
 			return "", ErrInvalidHost
 		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+				return "", ErrInvalidHost
+			}
+		}
 	}
-	return label + ".local", nil
+	return prefix + ".local", nil
 }

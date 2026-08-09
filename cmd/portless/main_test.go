@@ -1,9 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -16,6 +23,8 @@ import (
 
 	"github.com/euforicio/portless/internal/client"
 	"github.com/euforicio/portless/internal/daemon"
+	"github.com/euforicio/portless/internal/lan"
+	"github.com/euforicio/portless/internal/mdns"
 	"github.com/euforicio/portless/internal/runner"
 	"github.com/euforicio/portless/internal/tailscale"
 )
@@ -31,6 +40,30 @@ func TestPortlessRunHelper(t *testing.T) {
 	data, _ := json.Marshal(values)
 	_ = os.WriteFile(os.Args[len(os.Args)-1], data, 0o600)
 	os.Exit(7)
+}
+
+func TestPortlessLANServerHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_PORTLESS_LAN_SERVER") != "1" {
+		return
+	}
+	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", os.Getenv("PORT")))
+	if err != nil {
+		os.Exit(70)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(writer, "lan-cli-ok") })}
+	_ = server.Serve(listener)
+	os.Exit(0)
+}
+
+func TestPortlessLANCrashSupervisorHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_PORTLESS_LAN_CRASH_SUPERVISOR") != "1" {
+		return
+	}
+	code := run(context.Background(), []string{
+		"run", "--name", "lan-crash", "--lan", "--ip", os.Getenv("PORTLESS_TEST_LAN_IP"), "--",
+		os.Args[0], "-test.run=TestPortlessLANServerHelper",
+	}, io.Discard, io.Discard)
+	os.Exit(code)
 }
 
 func TestCommandSurfaceUsesRealManagementSocket(t *testing.T) {
@@ -207,6 +240,183 @@ func TestGenericRunRegistersCleansAndPreservesExitStatus(t *testing.T) {
 	}
 }
 
+func TestGenericRunLANEndToEndAndSignalCleanup(t *testing.T) {
+	addresses, err := mdns.EligibleAddresses()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) == 0 {
+		t.Skip("no eligible assigned LAN address")
+	}
+	socketPath := startRuntime(t, "")
+	t.Setenv("PORTLESS_SOCKET", socketPath)
+	t.Setenv("PORTLESS_RUNNER_STATE", filepath.Join(t.TempDir(), "runner"))
+	t.Setenv("GO_WANT_PORTLESS_LAN_SERVER", "1")
+	readOutput, writeOutput, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOutput.Close()
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{"run", "--name", "lan-cli", "--lan", "--ip", addresses[0].Address.String(), "--", os.Args[0], "-test.run=TestPortlessLANServerHelper"}, writeOutput, &stderr)
+		_ = writeOutput.Close()
+	}()
+	scanner := bufio.NewScanner(readOutput)
+	var lanURL string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "http://lan-cli.local:") {
+			lanURL = line
+			break
+		}
+	}
+	if lanURL == "" {
+		cancel()
+		t.Fatalf("LAN URL not printed: %v; stderr=%s", scanner.Err(), stderr.String())
+	}
+	parsed, err := url.Parse(lanURL)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(addresses[0].Address.String(), parsed.Port()))
+	}
+	httpClient := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	var response *http.Response
+	for time.Now().Before(deadline) {
+		response, err = httpClient.Get(lanURL)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if string(body) != "lan-cli-ok" {
+		cancel()
+		t.Fatalf("LAN body = %q", body)
+	}
+	var cleanOutput bytes.Buffer
+	if code := run(t.Context(), []string{"clean", "--routes", "--yes"}, &cleanOutput, &stderr); code != 0 {
+		cancel()
+		t.Fatalf("clean code = %d, stdout=%s stderr=%s", code, cleanOutput.String(), stderr.String())
+	}
+	time.Sleep(2500 * time.Millisecond)
+	exposures, err := ownedLANExposures()
+	if err != nil || len(exposures) != 0 {
+		cancel()
+		t.Fatalf("LAN state after clean = %#v, %v", exposures, err)
+	}
+	if response, requestErr := httpClient.Get(lanURL); requestErr == nil {
+		response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			cancel()
+			t.Fatalf("LAN after clean status = %d", response.StatusCode)
+		}
+	}
+	cancel()
+	if code := <-done; code != 143 {
+		t.Fatalf("cancelled run code = %d, stderr=%s", code, stderr.String())
+	}
+	exposures, err = ownedLANExposures()
+	if err != nil || len(exposures) != 0 {
+		t.Fatalf("LAN state after signal = %#v, %v", exposures, err)
+	}
+	listed, err := (client.Client{SocketPath: socketPath}).Call(t.Context(), client.Request{Operation: client.OperationList})
+	if err != nil || len(listed.Routes) != 0 {
+		t.Fatalf("routes after signal = %#v, %v", listed.Routes, err)
+	}
+}
+
+func TestLANCrashReconcilesExactAdvertisementWithPrune(t *testing.T) {
+	addresses, err := mdns.EligibleAddresses()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) == 0 {
+		t.Skip("no eligible assigned LAN address")
+	}
+	socketPath := startRuntime(t, "")
+	runnerDirectory := filepath.Join(t.TempDir(), "runner")
+	t.Setenv("PORTLESS_SOCKET", socketPath)
+	t.Setenv("PORTLESS_RUNNER_STATE", runnerDirectory)
+	supervisor := exec.Command(os.Args[0], "-test.run=TestPortlessLANCrashSupervisorHelper")
+	supervisor.Env = append(os.Environ(),
+		"GO_WANT_PORTLESS_LAN_CRASH_SUPERVISOR=1", "GO_WANT_PORTLESS_LAN_SERVER=1",
+		"PORTLESS_TEST_LAN_IP="+addresses[0].Address.String(),
+	)
+	if err := supervisor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if supervisor.ProcessState == nil {
+			_ = supervisor.Process.Kill()
+			_ = supervisor.Wait()
+		}
+	}()
+	manager, err := runner.Open(runnerDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var record runner.Record
+	var advertisement mdns.Identity
+	for time.Now().Before(deadline) {
+		discovered, discoverErr := manager.Discover()
+		exposures, stateErr := ownedLANExposures()
+		if discoverErr == nil && stateErr == nil && len(discovered) == 1 && len(exposures) == 1 && exposures[0].Registration.MDNS.PID > 0 {
+			record = discovered[0].Record
+			advertisement = exposures[0].Registration.MDNS
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if record.Identity.PID == 0 || advertisement.PID == 0 {
+		t.Fatal("crash fixture did not become active")
+	}
+	if err := supervisor.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = supervisor.Wait()
+	if err := syscall.Kill(-record.ProcessGroup, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		discovered, _ := manager.Discover()
+		if len(discovered) == 1 && discovered[0].Status == runner.StatusStale {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(t.Context(), []string{"prune"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("prune code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if err := mdns.StopOwned(advertisement); err != nil {
+		t.Fatalf("owned advertisement remained after prune: %v", err)
+	}
+	exposures, err := ownedLANExposures()
+	if err != nil || len(exposures) != 0 {
+		t.Fatalf("LAN state after crash prune = %#v, %v", exposures, err)
+	}
+	listed, err := (client.Client{SocketPath: socketPath}).Call(t.Context(), client.Request{Operation: client.OperationList})
+	if err != nil || len(listed.Routes) != 0 {
+		t.Fatalf("routes after crash prune = %#v, %v", listed.Routes, err)
+	}
+}
+
 func TestOwnedShareStateRoundTrip(t *testing.T) {
 	t.Setenv("PORTLESS_RUNNER_STATE", filepath.Join(t.TempDir(), "runner"))
 	identity := runner.Identity{PID: 42, Start: 99}
@@ -224,6 +434,41 @@ func TestOwnedShareStateRoundTrip(t *testing.T) {
 	shares, err = ownedShares()
 	if err != nil || len(shares) != 0 {
 		t.Fatalf("shares after remove = %#v, err=%v", shares, err)
+	}
+}
+
+func TestOwnedLANStateRoundTrip(t *testing.T) {
+	t.Setenv("PORTLESS_RUNNER_STATE", filepath.Join(t.TempDir(), "runner"))
+	identity := runner.Identity{PID: 42, Start: 99}
+	registration := lan.Registration{
+		Name: "app.local", Target: "http://127.0.0.1:3000", Scheme: "http",
+		Address: "192.168.1.20", Port: 54321, Interface: "en0", MDNS: mdns.Identity{PID: 43, Start: 100},
+	}
+	if err := updateOwnedLAN(identity, registration); err != nil {
+		t.Fatal(err)
+	}
+	exposures, err := ownedLANExposures()
+	if err != nil || len(exposures) != 1 || exposures[0].Identity != identity || exposures[0].Registration != registration {
+		t.Fatalf("LAN exposures = %#v, err=%v", exposures, err)
+	}
+	if err := removeOwnedLAN(identity, registration.Name); err != nil {
+		t.Fatal(err)
+	}
+	exposures, err = ownedLANExposures()
+	if err != nil || len(exposures) != 0 {
+		t.Fatalf("LAN after remove = %#v, err=%v", exposures, err)
+	}
+}
+
+func TestLANFlagsRequireExplicitOptIn(t *testing.T) {
+	for _, arguments := range [][]string{{"--https", "--", "true"}, {"--ip", "192.168.1.2", "--", "true"}} {
+		if _, err := parseRunOptions(arguments, &bytes.Buffer{}, false); err == nil {
+			t.Fatalf("parseRunOptions(%v) accepted implicit LAN", arguments)
+		}
+	}
+	options, err := parseRunOptions([]string{"--lan", "--https", "--ip", "192.168.1.2", "--", "true"}, &bytes.Buffer{}, false)
+	if err != nil || !options.lan || !options.https || options.ip != "192.168.1.2" {
+		t.Fatalf("explicit LAN options = %#v, %v", options, err)
 	}
 }
 
