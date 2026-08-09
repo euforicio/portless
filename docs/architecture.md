@@ -16,6 +16,13 @@ The daemon is the only privileged process. It owns ports 80 and 443, private CA
 material, the durable route registry, and the management socket. The CLI never
 writes root-owned configuration directly.
 
+`internal/daemon` is the composition root. Startup validates and loads the
+versioned `routes.json` registry, revalidates dynamic owners before activation,
+opens the exact-host authority, binds every configured listener, and only then
+starts serving. Any partial bind is rolled back. Shutdown stops management
+acceptance first, cancels refresh work, drains HTTP servers, closes idle proxy
+connections, and force-closes remaining hijacked or blocked connections.
+
 ## Component boundaries
 
 ### Proxy and routes
@@ -45,9 +52,26 @@ writes root-owned configuration directly.
 - Resolve the configured container with Apple's `container` CLI.
 - Accept only running containers with a declared TCP port and reachable address.
 - Refresh routes after container restart or address change.
-- Expose `install`, `add`, `remove`, `list`, `status`, `doctor`, and `uninstall`
-  through a small command surface.
+- Expose `install`, `upgrade`, `add`, `remove`, `list`, `status`, `doctor`,
+  `refresh`, and `uninstall` through a small command surface.
 - Keep static aliases and process-owned development routes distinguishable.
+- Re-inspect container owners at startup, every five seconds, and on explicit
+  `refresh`. An unverifiable owner remains registered but has no active proxy
+  route until inspection succeeds again.
+- Persist the kernel-authenticated operator UID for container ownership. The
+  system daemon uses trusted `/bin/launchctl asuser` to enter that login
+  bootstrap, drops to the resolved UID/GID and supplementary groups, supplies a
+  minimal environment, and only then executes the configured absolute CLI.
+
+### Durable route state
+
+The daemon stores canonical protocol route records, including ownership, in
+`<state-dir>/routes.json`. The file is strict versioned JSON, `0600`, owned by
+the daemon UID, size- and count-bounded, and never followed through a symlink.
+Mutations validate the complete next proxy snapshot, write a same-directory
+temporary file, sync it, rename it, sync the directory, and then publish the
+new route table. Security-driven deactivation removes a stale endpoint from the
+live table before attempting a durable metadata update.
 
 ## Security invariants
 
@@ -55,6 +79,10 @@ writes root-owned configuration directly.
 - `.localhost` is the default and requires no hosts-file mutation.
 - Route names are normalized DNS labels and exact-match by default.
 - The management socket verifies local ownership and accepts a narrow schema.
+- Process-owned routes are tied to the peer UID and a kernel process-start
+  identity rather than a reusable PID alone.
+- Container inspector UIDs are daemon-derived and non-root. Request JSON cannot
+  select an identity, and the mutable user CLI is never executed as root.
 - The daemon validates all upstreams; clients cannot request arbitrary files,
   commands, listener addresses, or daemon flags.
 - CA private keys are readable only by root.

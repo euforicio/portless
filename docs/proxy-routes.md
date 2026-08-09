@@ -43,6 +43,12 @@ returns 405. An outbound hop marker causes a recursive route to terminate with
 502 without exposing dial details. Absolute-form, opaque, and userinfo-bearing
 request targets are rejected before upstream rewriting.
 
+At the composed runtime boundary, loopback HTTP redirects only a registered
+canonical host to `https://<host><request-uri>` with status 308; arbitrary Host
+input is never reflected. HTTPS has no default certificate, issues only for an
+active exact route, and returns 421 when the normalized HTTP Host differs from
+the TLS SNI name.
+
 Ordinary HTTP/1.1 WebSocket upgrades use the standard library's 101-response
 hijack and bidirectional-copy path. Tests exercise HMR-shaped query and text
 traffic, fragmented frames, close frames, and abrupt disconnects over real TCP

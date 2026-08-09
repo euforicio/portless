@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,6 +26,32 @@ func TestResolveExecutesInspectAndParsesEndpoint(t *testing.T) {
 	}
 	if len(endpoint.Addresses) != 2 || endpoint.Addresses[1].String() != "fd00::2" {
 		t.Fatalf("unexpected addresses: %v", endpoint.Addresses)
+	}
+}
+
+func TestResolveUsesConfiguredUnprivilegedLoginSession(t *testing.T) {
+	directory := t.TempDir()
+	fixturePath := filepath.Join(directory, "inspect.json")
+	uidPath := filepath.Join(directory, "uid")
+	if err := os.WriteFile(fixturePath, []byte(runningFixture("app", `[{"containerPort":8080,"count":1,"proto":"tcp"}]`)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(directory, "container-fixture")
+	script := fmt.Sprintf("#!/bin/sh\n/usr/bin/id -u > '%s'\nexec /bin/cat '%s'\n", uidPath, fixturePath)
+	if err := os.WriteFile(executable, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	credential := currentCredential(t)
+	resolver := Resolver{Executable: executable, Credential: &credential}
+	if _, err := resolver.Resolve(t.Context(), "app", 8080, "http"); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := os.ReadFile(uidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(observed)) != strconv.FormatUint(uint64(credential.UID), 10) {
+		t.Fatalf("inspector UID = %q, want %d", observed, credential.UID)
 	}
 }
 
@@ -137,13 +164,43 @@ func TestRealAppleContainerInspect(t *testing.T) {
 	if err != nil || portValue == 0 {
 		t.Fatal("PORTLESS_TEST_CONTAINER_PORT must name the running container's TCP port")
 	}
-	endpoint, err := (Resolver{}).Resolve(context.Background(), containerID, uint16(portValue), "http")
+	credential := currentCredential(t)
+	endpoint, err := (Resolver{Credential: &credential}).Resolve(context.Background(), containerID, uint16(portValue), "http")
 	if err != nil {
 		t.Fatalf("real Resolve: %v", err)
 	}
 	if endpoint.Container != containerID || !endpoint.Address.IsValid() {
 		t.Fatalf("unexpected endpoint: %#v", endpoint)
 	}
+}
+
+func currentCredential(t *testing.T) Credential {
+	t.Helper()
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, err := strconv.ParseUint(account.Uid, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid, err := strconv.ParseUint(account.Gid, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupValues, err := account.GroupIds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := make([]uint32, 0, len(groupValues))
+	for _, value := range groupValues {
+		group, parseErr := strconv.ParseUint(value, 10, 32)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		groups = append(groups, uint32(group))
+	}
+	return Credential{UID: uint32(uid), GID: uint32(gid), Groups: groups, Username: account.Username, HomeDir: account.HomeDir}
 }
 
 func fixtureResolver(t *testing.T, fixture string) Resolver {

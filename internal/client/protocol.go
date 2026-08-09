@@ -18,6 +18,7 @@ const (
 	OperationList      Operation = "list"
 	OperationStatus    Operation = "status"
 	OperationDoctor    Operation = "doctor"
+	OperationRefresh   Operation = "refresh"
 	OperationUninstall Operation = "uninstall"
 )
 
@@ -68,11 +69,13 @@ type Route struct {
 }
 
 type Owner struct {
-	Kind      OwnerKind     `json:"kind"`
-	PID       int           `json:"pid,omitempty"`
-	Container string        `json:"container,omitempty"`
-	Network   string        `json:"network,omitempty"`
-	Refresh   RefreshPolicy `json:"refresh"`
+	Kind         OwnerKind     `json:"kind"`
+	PID          int           `json:"pid,omitempty"`
+	ProcessStart int64         `json:"process_start,omitempty"`
+	InspectorUID uint32        `json:"inspector_uid,omitempty"`
+	Container    string        `json:"container,omitempty"`
+	Network      string        `json:"network,omitempty"`
+	Refresh      RefreshPolicy `json:"refresh"`
 }
 
 type Status struct {
@@ -115,7 +118,7 @@ func (r Request) Validate() error {
 		if name != r.Name {
 			return errors.New("remove request name is not canonical")
 		}
-	case OperationInstall, OperationList, OperationStatus, OperationDoctor, OperationUninstall:
+	case OperationInstall, OperationList, OperationStatus, OperationDoctor, OperationRefresh, OperationUninstall:
 		if r.Route != nil || r.Name != "" {
 			return fmt.Errorf("%s request must not include route data", r.Operation)
 		}
@@ -149,21 +152,21 @@ func (r Route) Validate() error {
 		if !address.IsLoopback() {
 			return errors.New("static routes must target a loopback address")
 		}
-		if r.Owner.PID != 0 || r.Owner.Container != "" || r.Owner.Network != "" || r.Owner.Refresh != RefreshNever {
+		if r.Owner.PID != 0 || r.Owner.ProcessStart != 0 || r.Owner.InspectorUID != 0 || r.Owner.Container != "" || r.Owner.Network != "" || r.Owner.Refresh != RefreshNever {
 			return errors.New("static route has invalid ownership metadata")
 		}
 	case OwnerProcess:
 		if !address.IsLoopback() {
 			return errors.New("process routes must target a loopback address")
 		}
-		if r.Owner.PID <= 0 || r.Owner.Container != "" || r.Owner.Network != "" || r.Owner.Refresh != RefreshNever {
+		if r.Owner.PID <= 0 || r.Owner.ProcessStart < 0 || r.Owner.InspectorUID != 0 || r.Owner.Container != "" || r.Owner.Network != "" || r.Owner.Refresh != RefreshNever {
 			return errors.New("process route has invalid ownership metadata")
 		}
 	case OwnerContainer:
 		if address.IsLoopback() || address.IsLinkLocalUnicast() || !address.IsPrivate() {
 			return errors.New("container routes must target a reachable container address")
 		}
-		if r.Owner.PID != 0 || validateOwnerToken(r.Owner.Container) != nil || validateOwnerToken(r.Owner.Network) != nil || r.Owner.Refresh != RefreshContainerAddress {
+		if r.Owner.PID != 0 || r.Owner.ProcessStart != 0 || validateOwnerToken(r.Owner.Container) != nil || validateOwnerToken(r.Owner.Network) != nil || r.Owner.Refresh != RefreshContainerAddress {
 			return errors.New("container route has invalid ownership metadata")
 		}
 	default:

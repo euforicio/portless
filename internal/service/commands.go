@@ -1,8 +1,10 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 )
 
@@ -23,6 +25,51 @@ type Command struct {
 	Path       string
 	Args       []string
 	WhenLoaded bool
+}
+
+// Loaded reports launchd's current job state using only the documented print
+// exit status. Human-oriented output is deliberately discarded.
+func (c Config) Loaded(ctx context.Context) (bool, error) {
+	if err := c.validate(); err != nil {
+		return false, err
+	}
+	err := exec.CommandContext(ctx, Launchctl, "print", "system/"+c.Label).Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		return false, nil
+	}
+	return false, err
+}
+
+// ApplyCommands executes a fixed, prevalidated launchctl plan. It never uses
+// sudo and skips WhenLoaded commands when the exact launchd job is absent.
+func ApplyCommands(ctx context.Context, commands []Command) error {
+	for _, command := range commands {
+		if command.Path != Launchctl || len(command.Args) == 0 {
+			return errors.New("refusing non-launchctl lifecycle command")
+		}
+		if command.WhenLoaded {
+			if len(command.Args) != 2 || command.Args[0] != "bootout" || !strings.HasPrefix(command.Args[1], "system/") {
+				return errors.New("invalid conditional lifecycle command")
+			}
+			loaded := exec.CommandContext(ctx, Launchctl, "print", command.Args[1]).Run()
+			if loaded != nil {
+				var exitError *exec.ExitError
+				if errors.As(loaded, &exitError) {
+					continue
+				}
+				return loaded
+			}
+		}
+		output, err := exec.CommandContext(ctx, command.Path, command.Args...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s: %w: %s", command.String(), err, strings.TrimSpace(string(output)))
+		}
+	}
+	return nil
 }
 
 func (c Command) String() string {

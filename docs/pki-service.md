@@ -68,6 +68,13 @@ duplicated. Production packaging must validate the result with:
 /usr/bin/plutil -lint -- /Library/LaunchDaemons/com.euforicio.portless.plist
 ```
 
+The property list also passes one absolute Apple `container` executable to the
+daemon. This avoids inherited `PATH` selection and the client-only
+`PORTLESS_CONTAINER_CLI` environment override. The root daemon never executes
+that user-managed path with root credentials: it launches trusted
+`/bin/launchctl asuser`, drops to the registration's daemon-derived login UID
+and groups, and executes the CLI inside that user's Apple-container domain.
+
 `Installer.Install` and `Installer.Upgrade` atomically reconcile binary and
 plist content, ownership, and modes. Identical input returns an unchanged audit
 report. `Status` reports paths, ownership, modes, sizes, and SHA-256 digests.
@@ -87,6 +94,12 @@ The installer invokes these plans only at the install, upgrade, or uninstall
 privilege boundary. Routine route operations connect directly to the Unix
 socket without `sudo`.
 
+The executable wires these pieces into an explicit bootstrap sequence:
+artifacts first, local authority creation, exact CA trust installation, fixed
+launchctl application when artifacts changed or the job is absent, and a
+bounded management-socket readiness check. The sequence is idempotent and
+recoverable by retry; it does not roll back pre-existing trust or state.
+
 ## Unix management boundary
 
 `ListenManagement` refuses relative or overlong paths, symlinks, regular files,
@@ -99,6 +112,12 @@ kernel's `LOCAL_PEERCRED` through `golang.org/x/sys/unix`; authorization uses
 the kernel UID and groups, never an owner field supplied in a request. Protocol
 handling must additionally impose deadlines, bounded request sizes, and the
 narrow route-management schema described in the architecture.
+
+The implementation limits management concurrency, authenticates before reading
+request data, requires exactly one bounded newline-delimited JSON frame, rejects
+unknown fields and trailing frames, and applies a total read/operation/write
+deadline. Shutdown closes accepted management connections before waiting for
+handler goroutines.
 
 Automated tests use temporary files, real P-256 certificates and TLS
 handshakes, real child executables and Unix sockets, read-only system-keychain

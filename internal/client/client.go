@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -16,7 +17,7 @@ import (
 )
 
 const (
-	DefaultSocketPath = "/var/run/portless.sock"
+	DefaultSocketPath = "/var/run/portless/management.sock"
 	defaultTimeout    = 5 * time.Second
 	maxResponseBytes  = 1 << 20
 )
@@ -77,7 +78,14 @@ func (c Client) Call(ctx context.Context, request Request) (Response, error) {
 		}
 	}
 
-	decoder := json.NewDecoder(io.LimitReader(connection, maxResponseBytes))
+	responseData, err := io.ReadAll(io.LimitReader(connection, maxResponseBytes+1))
+	if err != nil {
+		return Response{}, fmt.Errorf("read management response: %w", err)
+	}
+	if len(responseData) > maxResponseBytes {
+		return Response{}, errors.New("management response exceeds size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(responseData))
 	decoder.DisallowUnknownFields()
 	var response Response
 	if err := decoder.Decode(&response); err != nil {

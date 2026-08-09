@@ -8,9 +8,13 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -33,6 +37,18 @@ var (
 type Resolver struct {
 	Executable string
 	Timeout    time.Duration
+	Credential *Credential
+}
+
+// Credential identifies the unprivileged macOS login session whose Apple
+// container catalog is inspected. The daemon derives it from kernel peer
+// credentials; it is never accepted from request JSON.
+type Credential struct {
+	UID      uint32
+	GID      uint32
+	Groups   []uint32
+	Username string
+	HomeDir  string
 }
 
 type Endpoint struct {
@@ -83,7 +99,31 @@ func (r Resolver) Resolve(ctx context.Context, name string, requestedPort uint16
 		return Endpoint{}, fmt.Errorf("find Apple container CLI: %w", err)
 	}
 
-	command := exec.CommandContext(inspectCtx, path, "inspect", name)
+	commandPath := path
+	arguments := []string{"inspect", name}
+	if r.Credential != nil {
+		if err := r.Credential.validate(); err != nil {
+			return Endpoint{}, err
+		}
+		commandPath = "/bin/launchctl"
+		arguments = []string{"asuser", strconv.FormatUint(uint64(r.Credential.UID), 10), path, "inspect", name}
+	}
+	command := exec.CommandContext(inspectCtx, commandPath, arguments...)
+	if r.Credential != nil {
+		credential := *r.Credential
+		if uint32(os.Geteuid()) != credential.UID {
+			command.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
+				Uid: credential.UID, Gid: credential.GID, Groups: slices.Clone(credential.Groups),
+			}}
+		}
+		command.Env = []string{
+			"HOME=" + credential.HomeDir,
+			"USER=" + credential.Username,
+			"LOGNAME=" + credential.Username,
+			"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+			"TMPDIR=/tmp",
+		}
+	}
 	stdout := boundedBuffer{limit: maxInspectBytes}
 	command.Stdout = &stdout
 	command.Stderr = io.Discard
@@ -138,6 +178,19 @@ func (r Resolver) Resolve(ctx context.Context, name string, requestedPort uint16
 		Port:      port,
 		Addresses: addresses,
 	}, nil
+}
+
+func (c Credential) validate() error {
+	if c.UID == 0 {
+		return errors.New("Apple container inspection requires an unprivileged user")
+	}
+	if c.Username == "" || strings.ContainsAny(c.Username, "=\x00\r\n") {
+		return errors.New("Apple container inspection user is invalid")
+	}
+	if !filepath.IsAbs(c.HomeDir) || strings.ContainsAny(c.HomeDir, "\x00\r\n") {
+		return errors.New("Apple container inspection home directory is invalid")
+	}
+	return nil
 }
 
 type inspectRecord struct {
