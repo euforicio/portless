@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -15,20 +16,21 @@ const DefaultLabel = "com.euforicio.portless"
 
 // Config defines the root LaunchDaemon and all paths it is allowed to use.
 type Config struct {
-	Label            string
-	Executable       string
-	PlistPath        string
-	StateDir         string
-	RuntimeDir       string
-	ManagementSocket string
-	ManagementGroup  string
-	ManagementGID    int
-	StdoutPath       string
-	StderrPath       string
-	HTTPListeners    []string
-	HTTPSListeners   []string
-	UID              int
-	GID              int
+	Label               string
+	Executable          string
+	PlistPath           string
+	StateDir            string
+	RuntimeDir          string
+	ManagementSocket    string
+	ManagementGroup     string
+	ManagementGID       int
+	ContainerExecutable string
+	StdoutPath          string
+	StderrPath          string
+	HTTPListeners       []string
+	HTTPSListeners      []string
+	UID                 int
+	GID                 int
 }
 
 // DefaultConfig returns the fixed production layout. The management group is
@@ -43,20 +45,21 @@ func DefaultConfig(managementGroup string) (Config, error) {
 		return Config{}, fmt.Errorf("management group %q has invalid GID %q", managementGroup, group.Gid)
 	}
 	return Config{
-		Label:            DefaultLabel,
-		Executable:       "/usr/local/libexec/portless",
-		PlistPath:        "/Library/LaunchDaemons/" + DefaultLabel + ".plist",
-		StateDir:         "/Library/Application Support/Portless",
-		RuntimeDir:       "/var/run/portless",
-		ManagementSocket: "/var/run/portless/management.sock",
-		ManagementGroup:  managementGroup,
-		ManagementGID:    managementGID,
-		StdoutPath:       "/Library/Logs/Portless/portless.log",
-		StderrPath:       "/Library/Logs/Portless/portless.error.log",
-		HTTPListeners:    []string{"127.0.0.1:80", "[::1]:80"},
-		HTTPSListeners:   []string{"127.0.0.1:443", "[::1]:443"},
-		UID:              0,
-		GID:              0,
+		Label:               DefaultLabel,
+		Executable:          "/usr/local/libexec/portless",
+		PlistPath:           "/Library/LaunchDaemons/" + DefaultLabel + ".plist",
+		StateDir:            "/Library/Application Support/Portless",
+		RuntimeDir:          "/var/run/portless",
+		ManagementSocket:    "/var/run/portless/management.sock",
+		ManagementGroup:     managementGroup,
+		ManagementGID:       managementGID,
+		ContainerExecutable: defaultContainerExecutable(),
+		StdoutPath:          "/Library/Logs/Portless/portless.log",
+		StderrPath:          "/Library/Logs/Portless/portless.error.log",
+		HTTPListeners:       []string{"127.0.0.1:80", "[::1]:80"},
+		HTTPSListeners:      []string{"127.0.0.1:443", "[::1]:443"},
+		UID:                 0,
+		GID:                 0,
 	}, nil
 }
 
@@ -68,6 +71,7 @@ func (c Config) validate() error {
 		"executable": c.Executable, "plist": c.PlistPath, "state directory": c.StateDir,
 		"runtime directory": c.RuntimeDir, "management socket": c.ManagementSocket,
 		"stdout": c.StdoutPath, "stderr": c.StderrPath,
+		"container executable": c.ContainerExecutable,
 	} {
 		if !filepath.IsAbs(path) || strings.ContainsRune(path, '\x00') {
 			return fmt.Errorf("%s path must be absolute", name)
@@ -116,6 +120,7 @@ func (c Config) Plist() ([]byte, error) {
 		"--state-dir", c.StateDir,
 		"--management-socket", c.ManagementSocket,
 		"--management-group", c.ManagementGroup,
+		"--container-cli", c.ContainerExecutable,
 	}
 	for _, address := range c.HTTPListeners {
 		arguments = append(arguments, "--http-listen", address)
@@ -143,6 +148,15 @@ func (c Config) Plist() ([]byte, error) {
 	writeInteger(&out, "ExitTimeOut", 30)
 	out.WriteString("</dict>\n</plist>\n")
 	return out.Bytes(), nil
+}
+
+func defaultContainerExecutable() string {
+	for _, candidate := range []string{"/opt/homebrew/bin/container", "/usr/local/bin/container", "/usr/bin/container"} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate
+		}
+	}
+	return "/usr/local/bin/container"
 }
 
 func isLoopbackListener(address string, wantedPort uint64) bool {

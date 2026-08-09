@@ -2,28 +2,32 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"net"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/euforicio/portless/internal/client"
+	"github.com/euforicio/portless/internal/daemon"
 )
 
 func TestCommandSurfaceUsesRealManagementSocket(t *testing.T) {
-	socketPath, requests := startManagementServer(t, 7)
+	socketPath := startRuntime(t, "/usr/bin/false")
 	t.Setenv("PORTLESS_SOCKET", socketPath)
 
 	commands := [][]string{
-		{"install"},
 		{"add", "App", "--port", "3000", "--pid", fmt.Sprint(os.Getpid())},
 		{"remove", "app.localhost"},
 		{"list"},
 		{"status"},
 		{"doctor"},
-		{"uninstall"},
+		{"refresh"},
 	}
 	for _, command := range commands {
 		var stdout bytes.Buffer
@@ -33,32 +37,76 @@ func TestCommandSurfaceUsesRealManagementSocket(t *testing.T) {
 		}
 	}
 
-	wantOperations := []client.Operation{
-		client.OperationInstall,
-		client.OperationAdd,
-		client.OperationRemove,
-		client.OperationList,
-		client.OperationStatus,
-		client.OperationDoctor,
-		client.OperationUninstall,
+}
+
+func TestBuiltExecutableRunsDaemonAndOrdinaryCLI(t *testing.T) {
+	directory := shortCommandTempDir(t)
+	binary := filepath.Join(directory, "portless")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build portless: %v: %s", err, output)
 	}
-	for _, want := range wantOperations {
-		request := <-requests
-		if request.Operation != want {
-			t.Fatalf("operation = %q, want %q", request.Operation, want)
+	stateDir := filepath.Join(directory, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(directory, "run", "management.sock")
+	group, err := user.LookupGroupId(strconv.Itoa(os.Getegid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := exec.Command(binary,
+		"daemon",
+		"--state-dir", stateDir,
+		"--management-socket", socket,
+		"--management-group", group.Name,
+		"--container-cli", "/usr/bin/false",
+		"--http-listen", "127.0.0.1:0",
+		"--https-listen", "127.0.0.1:0",
+		"--refresh-interval", "-1s",
+	)
+	var daemonOutput bytes.Buffer
+	process.Stdout = &daemonOutput
+	process.Stderr = &daemonOutput
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if process.ProcessState == nil {
+			_ = process.Process.Kill()
+			_ = process.Wait()
 		}
-		if want == client.OperationAdd {
-			if request.Route == nil || request.Route.Name != "app.localhost" || request.Route.Owner.Kind != client.OwnerProcess || request.Route.Owner.PID != os.Getpid() {
-				t.Fatalf("unexpected add route: %#v", request.Route)
-			}
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		status := exec.Command(binary, "status")
+		status.Env = append(os.Environ(), "PORTLESS_SOCKET="+socket)
+		output, statusErr := status.CombinedOutput()
+		if statusErr == nil && strings.HasPrefix(string(output), "running\n") {
+			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon did not become ready: %v: %s; daemon: %s", statusErr, output, daemonOutput.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := process.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Wait(); err != nil {
+		t.Fatalf("daemon shutdown: %v: %s", err, daemonOutput.String())
+	}
+	if _, err := os.Lstat(socket); !os.IsNotExist(err) {
+		t.Fatalf("management socket remained after shutdown: %v", err)
 	}
 }
 
 func TestAddAppleContainerSendsRefreshableOwner(t *testing.T) {
-	socketPath, requests := startManagementServer(t, 1)
+	executable := containerFixtureExecutable(t)
+	socketPath := startRuntime(t, executable)
 	t.Setenv("PORTLESS_SOCKET", socketPath)
-	t.Setenv("PORTLESS_CONTAINER_CLI", containerFixtureExecutable(t))
+	t.Setenv("PORTLESS_CONTAINER_CLI", executable)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -66,16 +114,20 @@ func TestAddAppleContainerSendsRefreshableOwner(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("run = %d, stderr: %s", code, stderr.String())
 	}
-	request := <-requests
-	if request.Route == nil {
-		t.Fatal("add request has no route")
+	response, err := (client.Client{SocketPath: socketPath}).Call(t.Context(), client.Request{Operation: client.OperationList})
+	if err != nil {
+		t.Fatal(err)
 	}
-	owner := request.Route.Owner
+	if len(response.Routes) != 1 {
+		t.Fatalf("routes = %#v", response.Routes)
+	}
+	route := response.Routes[0]
+	owner := route.Owner
 	if owner.Kind != client.OwnerContainer || owner.Container != "fieldnotes" || owner.Network != "default" || owner.Refresh != client.RefreshContainerAddress {
 		t.Fatalf("unexpected owner: %#v", owner)
 	}
-	if request.Route.Host != "192.168.64.8" || request.Route.Port != 80 {
-		t.Fatalf("unexpected upstream: %#v", request.Route)
+	if route.Host != "192.168.64.8" || route.Port != 80 {
+		t.Fatalf("unexpected upstream: %#v", route)
 	}
 }
 
@@ -107,53 +159,35 @@ func TestStatusReportsStoppedWhenSocketIsAbsent(t *testing.T) {
 	}
 }
 
-func startManagementServer(t *testing.T, calls int) (string, <-chan client.Request) {
+func startRuntime(t *testing.T, containerCLI string) string {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "portless-cli-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	socketPath := filepath.Join(directory, "management.sock")
-	listener, err := net.Listen("unix", socketPath)
+	stateDir := filepath.Join(directory, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(directory, "run", "management.sock")
+	runtime, err := daemon.Start(t.Context(), daemon.Config{
+		StateDir:         stateDir,
+		ManagementSocket: socketPath,
+		ManagementUID:    os.Geteuid(),
+		ManagementGID:    os.Getegid(),
+		HTTPListeners:    []string{"127.0.0.1:0"},
+		HTTPSListeners:   []string{"127.0.0.1:0"},
+		ContainerCLI:     containerCLI,
+		RefreshInterval:  -1,
+		ShutdownTimeout:  2 * time.Second,
+		Version:          "test",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = listener.Close() })
-	if err := os.Chmod(socketPath, 0o660); err != nil {
-		t.Fatal(err)
-	}
-
-	requests := make(chan client.Request, calls)
-	go func() {
-		defer close(requests)
-		for range calls {
-			connection, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			var request client.Request
-			decodeErr := json.NewDecoder(connection).Decode(&request)
-			if decodeErr == nil {
-				requests <- request
-				response := client.Response{Version: client.ProtocolVersion, ID: request.ID, OK: true}
-				switch request.Operation {
-				case client.OperationList:
-					response.Routes = []client.Route{{
-						Name: "app.localhost", Scheme: "http", Host: "127.0.0.1", Port: 3000,
-						Owner: client.Owner{Kind: client.OwnerStatic, Refresh: client.RefreshNever},
-					}}
-				case client.OperationStatus:
-					response.Status = &client.Status{Running: true, Version: "test", SocketPath: socketPath}
-				case client.OperationDoctor:
-					response.Diagnostics = []client.Diagnostic{{Name: "socket", Level: "ok", Message: "reachable"}}
-				}
-				_ = json.NewEncoder(connection).Encode(response)
-			}
-			_ = connection.Close()
-		}
-	}()
-	return socketPath, requests
+	t.Cleanup(func() { _ = runtime.Close(t.Context()) })
+	return socketPath
 }
 
 func containerFixtureExecutable(t *testing.T) string {
@@ -170,4 +204,14 @@ func containerFixtureExecutable(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return executablePath
+}
+
+func shortCommandTempDir(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("/tmp", "portless-command-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	return directory
 }

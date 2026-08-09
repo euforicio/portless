@@ -56,6 +56,10 @@ func TestRouteValidationKeepsOwnersDistinct(t *testing.T) {
 	if err := container.Validate(); err != nil {
 		t.Fatalf("validate container route: %v", err)
 	}
+	container.Owner.InspectorUID = 501
+	if err := container.Validate(); err != nil {
+		t.Fatalf("validate daemon-owned container inspector: %v", err)
+	}
 
 	container.Owner.Refresh = RefreshNever
 	if err := container.Validate(); err == nil {
@@ -69,5 +73,10 @@ func TestRouteValidationKeepsOwnersDistinct(t *testing.T) {
 	static.Host = netip.MustParseAddr("192.168.64.2").String()
 	if err := static.Validate(); err == nil {
 		t.Fatal("static route with non-loopback host succeeded")
+	}
+	static.Host = "127.0.0.1"
+	static.Owner.InspectorUID = 501
+	if err := static.Validate(); err == nil {
+		t.Fatal("static route with a container inspector succeeded")
 	}
 }

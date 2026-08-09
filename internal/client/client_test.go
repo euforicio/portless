@@ -163,6 +163,34 @@ func TestClientRejectsMultipleResponses(t *testing.T) {
 	}
 }
 
+func TestClientRejectsOversizedResponse(t *testing.T) {
+	socketPath := filepath.Join(shortTempDir(t), "management.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if err := os.Chmod(socketPath, 0o660); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		var request Request
+		_ = json.NewDecoder(connection).Decode(&request)
+		_, _ = connection.Write(make([]byte, maxResponseBytes+1))
+	}()
+
+	_, err = (Client{SocketPath: socketPath, Timeout: time.Second}).Call(context.Background(), Request{Operation: OperationList})
+	if err == nil || !strings.Contains(err.Error(), "exceeds size limit") {
+		t.Fatalf("Call error = %v, want oversized-response error", err)
+	}
+}
+
 func shortTempDir(t *testing.T) string {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "portless-")

@@ -27,6 +27,8 @@ func TestLaunchDaemonPlistPassesNativeValidation(t *testing.T) {
 		"<string>0077</string>",
 		"<string>127.0.0.1:80</string>",
 		"<string>[::1]:443</string>",
+		"<string>--container-cli</string>",
+		"<string>" + config.ContainerExecutable + "</string>",
 	} {
 		if !bytes.Contains(plist, []byte(required)) {
 			t.Errorf("plist is missing %q", required)
@@ -54,6 +56,14 @@ func TestLaunchDaemonPlistPassesNativeValidation(t *testing.T) {
 	}
 	if strings.TrimSpace(string(output)) != config.Label {
 		t.Fatalf("plist label = %q", output)
+	}
+}
+
+func TestLaunchDaemonRejectsRelativeContainerExecutable(t *testing.T) {
+	config := temporaryConfig(t)
+	config.ContainerExecutable = "container"
+	if _, err := config.Plist(); err == nil {
+		t.Fatal("relative container executable was accepted")
 	}
 }
 
@@ -94,6 +104,13 @@ func TestLifecycleCommandsAreAuditable(t *testing.T) {
 	}
 	if !strings.Contains(install[1].String(), config.PlistPath) {
 		t.Fatalf("command is not auditable: %s", install[1].String())
+	}
+}
+
+func TestLifecycleExecutorRejectsNonLaunchctlCommands(t *testing.T) {
+	err := ApplyCommands(t.Context(), []Command{{Path: "/usr/bin/true", Args: []string{"unexpected"}}})
+	if err == nil || !strings.Contains(err.Error(), "non-launchctl") {
+		t.Fatalf("ApplyCommands error = %v", err)
 	}
 }
 
