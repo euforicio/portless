@@ -6,8 +6,8 @@
 Browser -> https://<name>.localhost:443
         -> root LaunchDaemon (TLS and reverse proxy)
         -> validated upstream
-           - loopback application port, or
-           - current Apple-container VM address and declared port
+           - loopback application or runtime-published host port, or
+           - private-unicast container/VM address and declared port
 
 Unprivileged CLI -> permissioned Unix socket -> LaunchDaemon route manager
 ```
@@ -16,10 +16,10 @@ The daemon is the only privileged process. It owns ports 80 and 443, private CA
 material, the durable route registry, and the management socket. The CLI never
 writes root-owned configuration directly.
 
-`internal/daemon` is the composition root. Startup validates and loads the
-versioned `routes.json` registry, revalidates dynamic owners before activation,
-opens the exact-host authority, binds every configured listener, and only then
-starts serving. Any partial bind is rolled back. Shutdown stops management
+`internal/daemon` is the composition root. Startup validates the persisted
+active profile before interpreting `routes.json`, revalidates dynamic owners,
+opens the configured certificate source, binds every configured listener, and
+only then starts serving. Any partial bind is rolled back. Shutdown stops management
 acceptance first, cancels refresh work, drains HTTP servers, closes idle proxy
 connections, and force-closes remaining hijacked or blocked connections.
 
@@ -47,9 +47,12 @@ connections, and force-closes remaining hijacked or blocked connections.
   Unix management socket.
 - Make install, upgrade, status, and uninstall idempotent and recoverable.
 
-### Apple-container and CLI integration
+### Generic runner and optional runtime discovery
 
-- Resolve the configured container with Apple's `container` CLI.
+- Execute arbitrary application argv directly through `internal/runner`.
+- Treat all validated IP-and-port aliases identically in the routing core.
+- Resolve a configured container with Apple's `container` CLI only on the
+  explicit optional adapter path.
 - Accept only running containers with a declared TCP port and reachable address.
 - Refresh routes after container restart or address change.
 - Expose `install`, `upgrade`, `add`, `remove`, `list`, `status`, `doctor`,
@@ -65,8 +68,9 @@ connections, and force-closes remaining hijacked or blocked connections.
 
 ### Durable route state
 
-The daemon stores canonical protocol route records, including ownership, in
-`<state-dir>/routes.json`. The file is strict versioned JSON, `0600`, owned by
+The daemon stores its active profile in strict `profile.json` and canonical
+protocol route records, including ownership, in `<state-dir>/routes.json`.
+The files are strict versioned JSON, `0600`, owned by
 the daemon UID, size- and count-bounded, and never followed through a symlink.
 Mutations validate the complete next proxy snapshot, write a same-directory
 temporary file, sync it, rename it, sync the directory, and then publish the
@@ -81,6 +85,8 @@ live table before attempting a durable metadata update.
 - The management socket verifies local ownership and accepts a narrow schema.
 - Process-owned routes are tied to the peer UID and a kernel process-start
   identity rather than a reusable PID alone.
+- Protocol v2 requires absent, exact-owner, or explicit-any match conditions;
+  owner comparison and mutation are atomic under the registry lock.
 - Container inspector UIDs are daemon-derived and non-root. Request JSON cannot
   select an identity, and the mutable user CLI is never executed as root.
 - The daemon validates all upstreams; clients cannot request arbitrary files,

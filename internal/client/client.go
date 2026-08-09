@@ -27,6 +27,13 @@ type Client struct {
 	Timeout    time.Duration
 }
 
+type ResponseError struct {
+	Code    string
+	Message string
+}
+
+func (e *ResponseError) Error() string { return fmt.Sprintf("%s: %s", e.Code, e.Message) }
+
 func (c Client) Call(ctx context.Context, request Request) (Response, error) {
 	if request.Version == 0 {
 		request.Version = ProtocolVersion
@@ -111,7 +118,7 @@ func (c Client) Call(ctx context.Context, request Request) (Response, error) {
 		if response.Error == nil || response.Error.Code == "" || response.Error.Message == "" {
 			return Response{}, errors.New("management response failed without a structured error")
 		}
-		return Response{}, fmt.Errorf("%s: %s", response.Error.Code, response.Error.Message)
+		return Response{}, &ResponseError{Code: response.Error.Code, Message: response.Error.Message}
 	}
 	return response, nil
 }

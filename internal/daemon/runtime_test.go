@@ -6,12 +6,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +23,7 @@ import (
 	"time"
 
 	"github.com/euforicio/portless/internal/client"
+	"github.com/euforicio/portless/internal/profile"
 	"github.com/euforicio/portless/internal/service"
 )
 
@@ -59,17 +62,17 @@ func TestRuntimeEndToEndTLSHTTP2RedirectWebSocketAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	management := client.Client{SocketPath: config.ManagementSocket, Timeout: time.Second}
+	management := client.Client{SocketPath: config.ManagementSocket}
 	registration := client.Route{
 		Name: "fieldnotes.localhost", Scheme: "http", Host: backendHost, Port: uint16(port),
 		Owner: client.Owner{Kind: client.OwnerStatic, Refresh: client.RefreshNever},
 	}
-	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &registration}); err != nil {
+	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &registration, Match: client.RouteMatchAbsent}); err != nil {
 		t.Fatal(err)
 	}
 	other := registration
 	other.Name = "other.localhost"
-	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &other}); err != nil {
+	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &other, Match: client.RouteMatchAbsent}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -189,7 +192,9 @@ func TestRuntimeEndToEndTLSHTTP2RedirectWebSocketAndPersistence(t *testing.T) {
 
 func TestManagementStrictFramingLifecycleBoundaryAndProcessIdentity(t *testing.T) {
 	config := integrationConfig(t)
-	config.ManagementTimeout = 100 * time.Millisecond
+	// Route mutations perform real durable fsyncs; leave enough headroom for
+	// concurrent commits under the race detector.
+	config.ManagementTimeout = 2 * time.Second
 	runtime, err := Start(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
@@ -207,7 +212,7 @@ func TestManagementStrictFramingLifecycleBoundaryAndProcessIdentity(t *testing.T
 		}
 	}
 
-	management := client.Client{SocketPath: config.ManagementSocket, Timeout: time.Second}
+	management := client.Client{SocketPath: config.ManagementSocket, Timeout: 3 * time.Second}
 	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationInstall}); err == nil || !strings.Contains(err.Error(), "privilege_required") {
 		t.Fatalf("lifecycle request error = %v", err)
 	}
@@ -219,8 +224,12 @@ func TestManagementStrictFramingLifecycleBoundaryAndProcessIdentity(t *testing.T
 		Name: "owned.localhost", Scheme: "http", Host: host, Port: uint16(port),
 		Owner: client.Owner{Kind: client.OwnerProcess, PID: os.Getpid(), Refresh: client.RefreshNever},
 	}
-	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &registration}); err != nil {
+	added, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &registration, Match: client.RouteMatchAbsent})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if added.Route == nil || added.Route.Owner.ProcessStart <= 0 {
+		t.Fatalf("add response did not return canonical ownership: %#v", added.Route)
 	}
 	listed, err := management.Call(t.Context(), client.Request{Operation: client.OperationList})
 	if err != nil {
@@ -229,6 +238,49 @@ func TestManagementStrictFramingLifecycleBoundaryAndProcessIdentity(t *testing.T
 	if len(listed.Routes) != 1 || listed.Routes[0].Owner.ProcessStart <= 0 {
 		t.Fatalf("process identity was not persisted: %#v", listed.Routes)
 	}
+	expectedOwner := added.Route.Owner
+	replacements := []client.Route{registration, registration}
+	for index := range replacements {
+		replacements[index].Port += uint16(index + 1)
+		replacements[index].Owner = client.Owner{Kind: client.OwnerStatic, Refresh: client.RefreshNever}
+	}
+	results := make(chan error, len(replacements))
+	for index := range replacements {
+		replacement := replacements[index]
+		go func() {
+			_, replaceErr := management.Call(t.Context(), client.Request{
+				Operation: client.OperationAdd, Route: &replacement, Match: client.RouteMatchOwner, ExpectedOwner: &expectedOwner,
+			})
+			results <- replaceErr
+		}()
+	}
+	var successes, conflicts int
+	for range replacements {
+		replaceErr := <-results
+		if replaceErr == nil {
+			successes++
+			continue
+		}
+		var responseErr *client.ResponseError
+		if errors.As(replaceErr, &responseErr) && responseErr.Code == "route_conflict" {
+			conflicts++
+			continue
+		}
+		t.Fatalf("conditional replacement error = %v", replaceErr)
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("conditional replacements: successes=%d conflicts=%d", successes, conflicts)
+	}
+	if _, err := management.Call(t.Context(), client.Request{
+		Operation: client.OperationRemove, Name: registration.Name, Match: client.RouteMatchOwner, ExpectedOwner: &expectedOwner,
+	}); err == nil {
+		t.Fatal("stale owner removed a replacement route")
+	} else {
+		var responseErr *client.ResponseError
+		if !errors.As(err, &responseErr) || responseErr.Code != "route_conflict" {
+			t.Fatalf("stale owner remove error = %v", err)
+		}
+	}
 	child := exec.Command("/bin/sleep", "10")
 	if err := child.Start(); err != nil {
 		t.Fatal(err)
@@ -236,7 +288,7 @@ func TestManagementStrictFramingLifecycleBoundaryAndProcessIdentity(t *testing.T
 	childRoute := registration
 	childRoute.Name = "child.localhost"
 	childRoute.Owner.PID = child.Process.Pid
-	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &childRoute}); err != nil {
+	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &childRoute, Match: client.RouteMatchAbsent}); err != nil {
 		_ = child.Process.Kill()
 		_ = child.Wait()
 		t.Fatal(err)
@@ -312,20 +364,20 @@ func TestContainerRefreshMovesTrafficUsingRealInspectorProcess(t *testing.T) {
 	}
 	requestOwned := registration
 	requestOwned.Owner.InspectorUID = uint32(os.Geteuid())
-	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &requestOwned}); err == nil || !strings.Contains(err.Error(), "daemon-owned") {
+	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &requestOwned, Match: client.RouteMatchAbsent}); err == nil || !strings.Contains(err.Error(), "daemon-owned") {
 		t.Fatalf("request-supplied inspector error = %v", err)
 	}
 	if _, err := runtime.executeRequest(t.Context(), service.PeerCredentials{UID: 0}, client.Request{
-		Version: client.ProtocolVersion, ID: "root-container", Operation: client.OperationAdd, Route: &registration,
+		Version: client.ProtocolVersion, ID: "root-container", Operation: client.OperationAdd, Route: &registration, Match: client.RouteMatchAbsent,
 	}); err == nil || !strings.Contains(err.Error(), "unprivileged login user") {
 		t.Fatalf("root container registration error = %v", err)
 	}
 	stale := registration
 	stale.Host = addresses[1].String()
-	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &stale}); err == nil || !strings.Contains(err.Error(), "stale_metadata") {
+	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &stale, Match: client.RouteMatchAbsent}); err == nil || !strings.Contains(err.Error(), "stale_metadata") {
 		t.Fatalf("stale container metadata error = %v", err)
 	}
-	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &registration}); err != nil {
+	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &registration, Match: client.RouteMatchAbsent}); err != nil {
 		t.Fatal(err)
 	}
 	rootPool := rootPool(t, config.StateDir)
@@ -364,6 +416,91 @@ func TestRuntimeRejectsUnsafeStateAndNonLoopbackListeners(t *testing.T) {
 	config.HTTPSListeners = []string{"0.0.0.0:0"}
 	if _, err := Start(t.Context(), config); err == nil || !strings.Contains(err.Error(), "not a literal loopback") {
 		t.Fatalf("public listener error = %v", err)
+	}
+}
+
+func TestCustomHTTPProfilePersistsCompatibilityAndRoutesCustomTLD(t *testing.T) {
+	directory := shortTempDir(t)
+	stateDir := filepath.Join(directory, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().String()
+	_ = probe.Close()
+	socket := filepath.Join(directory, "run", "management.sock")
+	config := Config{
+		StateDir: stateDir, ManagementSocket: socket,
+		ManagementUID: os.Geteuid(), ManagementGID: os.Getegid(),
+		RefreshInterval: -1, ShutdownTimeout: 2 * time.Second,
+		Profile: &profile.Config{Scheme: profile.HTTP, ListenAddress: address, TLD: ".test"},
+	}
+	runtime, err := Start(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { _, _ = writer.Write([]byte("custom")) }))
+	defer backend.Close()
+	backendURL, _ := url.Parse(backend.URL)
+	backendHost, backendPort, _ := net.SplitHostPort(backendURL.Host)
+	port, _ := strconv.ParseUint(backendPort, 10, 16)
+	route := client.Route{Name: "app.test", Scheme: "http", Host: backendHost, Port: uint16(port), Owner: client.Owner{Kind: client.OwnerStatic, Refresh: client.RefreshNever}}
+	management := client.Client{SocketPath: socket}
+	if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &route, Match: client.RouteMatchAbsent}); err != nil {
+		t.Fatal(err)
+	}
+	request, _ := http.NewRequest(http.MethodGet, "http://"+address, nil)
+	request.Host = "app.test"
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if string(body) != "custom" {
+		t.Fatalf("body = %q", body)
+	}
+	if err := runtime.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	config.Profile = &profile.Config{Scheme: profile.HTTP, ListenAddress: address, TLD: ".internal"}
+	if _, err := Start(t.Context(), config); err == nil || !strings.Contains(err.Error(), "differs from persisted") {
+		t.Fatalf("profile mismatch error = %v", err)
+	}
+	config.ReconcileProfile = true
+	if _, err := Start(t.Context(), config); err == nil || !strings.Contains(err.Error(), "while routes are registered") {
+		t.Fatalf("unsafe profile reconciliation error = %v", err)
+	}
+}
+
+func TestExplicitProfileReconciliationSucceedsOnlyWithEmptyRegistry(t *testing.T) {
+	config := integrationConfig(t)
+	legacy, err := Start(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().String()
+	_ = probe.Close()
+	config.HTTPListeners = nil
+	config.HTTPSListeners = nil
+	config.Profile = &profile.Config{Scheme: profile.HTTP, ListenAddress: address, TLD: ".test"}
+	config.ReconcileProfile = true
+	custom, err := Start(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := custom.Close(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -16,13 +16,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/euforicio/portless/internal/applecontainer"
 	"github.com/euforicio/portless/internal/client"
 	"github.com/euforicio/portless/internal/pki"
+	"github.com/euforicio/portless/internal/profile"
 	"github.com/euforicio/portless/internal/proxy"
 	"github.com/euforicio/portless/internal/routes"
 	"github.com/euforicio/portless/internal/service"
@@ -48,6 +48,12 @@ type Config struct {
 	ManagementTimeout time.Duration
 	Version           string
 	Logger            *log.Logger
+	// Profile selects one custom public loopback listener. Nil preserves the
+	// production-compatible dual-stack HTTP redirect and HTTPS listener set.
+	Profile *profile.Config
+	// ReconcileProfile permits an explicit service lifecycle operation to
+	// replace persisted profile settings only when no routes are registered.
+	ReconcileProfile bool
 }
 
 // Runtime owns every listener and background task for one daemon process.
@@ -59,11 +65,15 @@ type Runtime struct {
 	registry              *registry
 	authority             *pki.Authority
 	proxy                 *proxy.Handler
+	publicProfile         *profile.Profile
 	management            *net.UnixListener
 	servers               []*http.Server
 	listeners             []net.Listener
 	httpAddrs             []string
 	httpsAddrs            []string
+	listenerHandlers      []http.Handler
+	listenerTLS           []*tls.Config
+	profileListener       []bool
 	serveErr              chan error
 	connections           connectionTracker
 	managementConnections connectionTracker
@@ -109,16 +119,38 @@ func (t *connectionTracker) closeAll() {
 // Start validates and binds the complete runtime before any serving goroutine
 // is launched. A partial bind is always rolled back.
 func Start(parent context.Context, config Config) (*Runtime, error) {
+	if config.Profile == nil && filepath.IsAbs(config.StateDir) {
+		persisted, found, loadErr := loadPersistedProfile(config.StateDir)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if found && !persisted.Legacy {
+			value := persisted.Config
+			config.Profile = &value
+			config.HTTPSListeners = nil
+			if value.Scheme == profile.HTTP {
+				config.HTTPListeners = nil
+			}
+		}
+	}
 	config, err := normalizeConfig(config)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
+	table := routes.NewTable()
+	if config.Profile != nil {
+		table, err = routes.NewTableWithOptions(routes.Options{TLD: config.Profile.TLD, WildcardFallback: config.Profile.WildcardFallback})
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+	}
 	runtime := &Runtime{
 		config:          config,
 		ctx:             ctx,
 		cancel:          cancel,
-		table:           routes.NewTable(),
+		table:           table,
 		serveErr:        make(chan error, 1),
 		managementSlots: make(chan struct{}, 64),
 	}
@@ -133,22 +165,53 @@ func Start(parent context.Context, config Config) (*Runtime, error) {
 		return nil, cause
 	}
 
+	persistedProfileConfig := profile.DefaultConfig()
+	if config.Profile != nil {
+		persistedProfileConfig = *config.Profile
+	}
+	if err := reconcileProfile(config.StateDir, persistedProfileConfig, config.Profile == nil, config.ReconcileProfile); err != nil {
+		return fail(err)
+	}
 	runtime.registry, err = openRegistry(config.StateDir, runtime.table)
 	if err != nil {
 		return fail(err)
 	}
-	runtime.authority, err = pki.Open(filepath.Join(config.StateDir, "pki"), pki.Options{
-		AllowHost: func(host string) bool {
-			_, found := runtime.table.Lookup(host)
-			return found
-		},
-	})
+	needsAuthority := config.Profile == nil || (config.Profile.Scheme == profile.HTTPS && config.Profile.Certificates.Mode == profile.GeneratedCertificates)
+	if needsAuthority {
+		allowedSuffix := ""
+		if config.Profile != nil {
+			allowedSuffix = config.Profile.TLD
+		}
+		runtime.authority, err = pki.Open(filepath.Join(config.StateDir, "pki"), pki.Options{
+			AllowedSuffix: allowedSuffix,
+			AllowHost: func(host string) bool {
+				_, found := runtime.table.Resolve(host)
+				return found
+			},
+		})
+		if err != nil {
+			return fail(err)
+		}
+	}
+	proxyOptions := proxy.Options{ErrorLog: config.Logger}
+	if config.Profile != nil {
+		_, port, _ := net.SplitHostPort(config.Profile.ListenAddress)
+		parsedPort, _ := strconv.ParseUint(port, 10, 16)
+		proxyOptions.PublicPort = uint16(parsedPort)
+	}
+	runtime.proxy, err = proxy.New(runtime.table, proxyOptions)
 	if err != nil {
 		return fail(err)
 	}
-	runtime.proxy, err = proxy.New(runtime.table, proxy.Options{ErrorLog: config.Logger})
-	if err != nil {
-		return fail(err)
+	if config.Profile != nil {
+		profileRuntime := profile.Runtime{Routes: runtime.table}
+		if runtime.authority != nil {
+			profileRuntime.GetCertificate = runtime.authority.GetCertificate
+		}
+		runtime.publicProfile, err = profile.New(*config.Profile, profileRuntime)
+		if err != nil {
+			return fail(err)
+		}
 	}
 	if _, err := runtime.Refresh(ctx); err != nil {
 		return fail(fmt.Errorf("initial route refresh: %w", err))
@@ -169,6 +232,9 @@ func Start(parent context.Context, config Config) (*Runtime, error) {
 		}
 		runtime.listeners = append(runtime.listeners, listener)
 		runtime.httpAddrs = append(runtime.httpAddrs, listener.Addr().String())
+		runtime.listenerHandlers = append(runtime.listenerHandlers, http.HandlerFunc(runtime.redirectHTTP))
+		runtime.listenerTLS = append(runtime.listenerTLS, nil)
+		runtime.profileListener = append(runtime.profileListener, false)
 	}
 	for _, address := range config.HTTPSListeners {
 		listener, listenErr := net.Listen("tcp", address)
@@ -177,6 +243,25 @@ func Start(parent context.Context, config Config) (*Runtime, error) {
 		}
 		runtime.listeners = append(runtime.listeners, listener)
 		runtime.httpsAddrs = append(runtime.httpsAddrs, listener.Addr().String())
+		runtime.listenerHandlers = append(runtime.listenerHandlers, http.HandlerFunc(runtime.serveHTTPS))
+		runtime.listenerTLS = append(runtime.listenerTLS, &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: runtime.authority.GetCertificate, NextProtos: []string{"h2", "http/1.1"}})
+		runtime.profileListener = append(runtime.profileListener, false)
+	}
+	if runtime.publicProfile != nil {
+		listener, listenErr := runtime.publicProfile.Listen()
+		if listenErr != nil {
+			return fail(fmt.Errorf("listen on profile %s: %w", runtime.publicProfile.ListenAddress(), listenErr))
+		}
+		runtime.listeners = append(runtime.listeners, listener)
+		handler := runtime.publicProfile.Handler(runtime.proxy)
+		runtime.listenerHandlers = append(runtime.listenerHandlers, handler)
+		runtime.listenerTLS = append(runtime.listenerTLS, runtime.publicProfile.TLSConfig())
+		runtime.profileListener = append(runtime.profileListener, true)
+		if runtime.publicProfile.Scheme() == profile.HTTPS {
+			runtime.httpsAddrs = append(runtime.httpsAddrs, listener.Addr().String())
+		} else {
+			runtime.httpAddrs = append(runtime.httpAddrs, listener.Addr().String())
+		}
 	}
 
 	runtime.startServing()
@@ -191,8 +276,9 @@ func (r *Runtime) startServing() {
 	}()
 
 	for index, listener := range r.listeners {
-		isHTTPS := index >= len(r.httpAddrs)
-		handler := r.trackHandler(http.HandlerFunc(r.redirectHTTP))
+		tlsConfig := r.listenerTLS[index]
+		isHTTPS := tlsConfig != nil
+		handler := r.trackHandler(r.listenerHandlers[index])
 		server := &http.Server{
 			Handler:           handler,
 			ReadHeaderTimeout: 5 * time.Second,
@@ -208,19 +294,16 @@ func (r *Runtime) startServing() {
 			},
 		}
 		if isHTTPS {
-			server.Handler = r.trackHandler(http.HandlerFunc(r.serveHTTPS))
-			server.TLSConfig = &tls.Config{
-				MinVersion:     tls.VersionTLS12,
-				GetCertificate: r.authority.GetCertificate,
-				NextProtos:     []string{"h2", "http/1.1"},
-			}
+			server.TLSConfig = tlsConfig
 		}
 		r.servers = append(r.servers, server)
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
 			var err error
-			if isHTTPS {
+			if r.profileListener[index] {
+				err = r.publicProfile.Serve(server, listener)
+			} else if isHTTPS {
 				err = server.ServeTLS(listener, "", "")
 			} else {
 				err = server.Serve(listener)
@@ -336,16 +419,28 @@ func (r *Runtime) redirectHTTP(writer http.ResponseWriter, request *http.Request
 		http.Error(writer, "invalid request target", http.StatusBadRequest)
 		return
 	}
-	host, err := routes.NormalizeAuthority(request.Host)
+	tld := ".localhost"
+	scheme := "https"
+	port := uint16(443)
+	if r.publicProfile != nil {
+		tld = r.publicProfile.TLD()
+		scheme = string(r.publicProfile.Scheme())
+		port = r.publicProfile.Port()
+	}
+	host, err := routes.NormalizeAuthorityForTLD(request.Host, tld)
 	if err != nil {
 		http.Error(writer, "invalid host", http.StatusBadRequest)
 		return
 	}
-	if _, found := r.table.Lookup(host); !found {
+	if _, found := r.table.Resolve(host); !found {
 		http.Error(writer, "unknown host", http.StatusNotFound)
 		return
 	}
-	target := "https://" + host + request.URL.RequestURI()
+	authority := host
+	if (scheme == "https" && port != 443) || (scheme == "http" && port != 80) {
+		authority = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	}
+	target := scheme + "://" + authority + request.URL.RequestURI()
 	http.Redirect(writer, request, target, http.StatusPermanentRedirect)
 }
 
@@ -354,8 +449,13 @@ func (r *Runtime) serveHTTPS(writer http.ResponseWriter, request *http.Request) 
 		http.Error(writer, "TLS server name is required", http.StatusMisdirectedRequest)
 		return
 	}
-	authority, err := routes.NormalizeAuthority(request.Host)
-	if err != nil || !strings.EqualFold(authority, request.TLS.ServerName) {
+	tld := ".localhost"
+	if r.publicProfile != nil {
+		tld = r.publicProfile.TLD()
+	}
+	authority, err := routes.NormalizeAuthorityForTLD(request.Host, tld)
+	serverName, sniErr := routes.NormalizeAuthorityForTLD(request.TLS.ServerName, tld)
+	if err != nil || sniErr != nil || authority != serverName {
 		http.Error(writer, "TLS server name and host differ", http.StatusMisdirectedRequest)
 		return
 	}
@@ -412,6 +512,9 @@ func (r *Runtime) Refresh(ctx context.Context) ([]client.Diagnostic, error) {
 }
 
 func (r *Runtime) containerResolver(uid uint32) (applecontainer.Resolver, error) {
+	if r.config.ContainerCLI == "" {
+		return applecontainer.Resolver{}, errors.New("Apple container adapter is not configured")
+	}
 	if uid == 0 {
 		return applecontainer.Resolver{}, errors.New("container registration has no unprivileged inspector")
 	}
@@ -454,15 +557,18 @@ func normalizeConfig(config Config) (Config, error) {
 	if config.ManagementUID < 0 || config.ManagementGID < 0 {
 		return Config{}, errors.New("management UID and GID must be non-negative")
 	}
-	if len(config.HTTPListeners) == 0 || len(config.HTTPSListeners) == 0 {
+	if config.Profile == nil && (len(config.HTTPListeners) == 0 || len(config.HTTPSListeners) == 0) {
 		return Config{}, errors.New("HTTP and HTTPS listeners are required")
+	}
+	if config.Profile != nil && len(config.HTTPSListeners) != 0 {
+		return Config{}, errors.New("custom profile cannot be combined with legacy HTTPS listeners")
 	}
 	for _, address := range append(slices.Clone(config.HTTPListeners), config.HTTPSListeners...) {
 		if err := validateLoopbackAddress(address); err != nil {
 			return Config{}, err
 		}
 	}
-	if !filepath.IsAbs(config.ContainerCLI) {
+	if config.ContainerCLI != "" && !filepath.IsAbs(config.ContainerCLI) {
 		return Config{}, errors.New("Apple container executable must be absolute")
 	}
 	if config.RefreshInterval == 0 {

@@ -3,7 +3,8 @@
 This slice keeps routine proxy management separate from installation privilege.
 The daemon runs as `root:wheel`, binds only `127.0.0.1` and `::1` on ports 80
 and 443, and exposes a `0660` Unix socket to one explicitly selected management
-group. The packages never invoke `sudo`.
+group. The packages never invoke `sudo`; the ordinary-user `init` command owns
+the single fixed `/usr/bin/sudo` reconciliation boundary.
 
 ## PKI lifecycle
 
@@ -68,8 +69,9 @@ duplicated. Production packaging must validate the result with:
 /usr/bin/plutil -lint -- /Library/LaunchDaemons/com.euforicio.portless.plist
 ```
 
-The property list also passes one absolute Apple `container` executable to the
-daemon. This avoids inherited `PATH` selection and the client-only
+When explicitly configured, the property list passes one absolute Apple
+`container` executable to the daemon. When absent, the adapter flag is omitted
+and the daemon has no container-runtime requirement. This avoids inherited `PATH` selection and the client-only
 `PORTLESS_CONTAINER_CLI` environment override. The root daemon never executes
 that user-managed path with root credentials: it launches trusted
 `/bin/launchctl asuser`, drops to the registration's daemon-derived login UID
@@ -94,10 +96,12 @@ The installer invokes these plans only at the install, upgrade, or uninstall
 privilege boundary. Routine route operations connect directly to the Unix
 socket without `sudo`.
 
-The executable wires these pieces into an explicit bootstrap sequence:
+The executable wires these pieces into an ordinary-user `init` sequence:
 artifacts first, local authority creation, exact CA trust installation, fixed
 launchctl application when artifacts changed or the job is absent, and a
-bounded management-socket readiness check. The sequence is idempotent and
+bounded management-socket readiness check, followed by doctor from the original
+user process. It also publishes the non-secret CA certificate at
+`/usr/local/share/portless/ca.pem` for child compatibility metadata. The sequence is idempotent and
 recoverable by retry; it does not roll back pre-existing trust or state.
 
 ## Unix management boundary

@@ -112,8 +112,11 @@ func New(config Config, runtime Runtime) (*Profile, error) {
 		},
 	}
 	if config.Scheme == HTTP {
-		if config.Certificates != (CertificateConfig{}) || runtime.Routes != nil || runtime.GetCertificate != nil {
+		if config.Certificates != (CertificateConfig{}) || runtime.GetCertificate != nil {
 			return nil, fmt.Errorf("%w: HTTP profile contains TLS settings", ErrInvalidCertificate)
+		}
+		if runtime.Routes != nil && runtime.Routes.Options() != profile.routeOptions {
+			return nil, fmt.Errorf("%w: route table policy differs from profile", ErrInvalidCertificate)
 		}
 		return profile, nil
 	}

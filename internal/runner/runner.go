@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,6 +51,8 @@ type Endpoint struct {
 // Spec describes one direct child-process execution.
 type Spec struct {
 	Name             string
+	TLD              string
+	PublicURL        string
 	Command          []string
 	WorkingDirectory string
 	Environment      map[string]string
@@ -119,7 +122,10 @@ func (manager *Manager) Start(ctx context.Context, spec Spec) (*Process, error) 
 		validated.endpoint.Port = port
 		if validated.spec.Proxy {
 			validated.endpoint.Host = "127.0.0.1"
-			validated.endpoint.URL = "https://" + validated.endpoint.Name
+			validated.endpoint.URL = validated.spec.PublicURL
+			if validated.endpoint.URL == "" {
+				validated.endpoint.URL = "https://" + validated.endpoint.Name
+			}
 		}
 
 		command := exec.Command(validated.spec.Command[0], validated.spec.Command[1:]...)
@@ -295,7 +301,7 @@ type validatedSpec struct {
 }
 
 func validateSpec(spec Spec) (validatedSpec, error) {
-	name, err := client.NormalizeName(spec.Name)
+	name, err := client.NormalizeNameForTLD(spec.Name, spec.TLD)
 	if err != nil {
 		return validatedSpec{}, fmt.Errorf("invalid runner name: %w", err)
 	}
@@ -330,6 +336,20 @@ func validateSpec(spec Spec) (validatedSpec, error) {
 	}
 	if !spec.Proxy && spec.AppPort != 0 {
 		return validatedSpec{}, errors.New("fixed app port requires proxy to be enabled")
+	}
+	if spec.PublicURL != "" {
+		if !spec.Proxy {
+			return validatedSpec{}, errors.New("public URL requires proxy to be enabled")
+		}
+		parsed, parseErr := url.Parse(spec.PublicURL)
+		if parseErr != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.Hostname() != name || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return validatedSpec{}, errors.New("public URL must be an HTTP(S) origin for the runner name")
+		}
+		if parsed.Port() != "" {
+			if value, portErr := strconv.ParseUint(parsed.Port(), 10, 16); portErr != nil || value == 0 {
+				return validatedSpec{}, errors.New("public URL has an invalid port")
+			}
+		}
 	}
 	if len(spec.Environment) > 256 {
 		return validatedSpec{}, errors.New("runner environment has too many entries")

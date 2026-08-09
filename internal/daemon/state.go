@@ -26,6 +26,8 @@ const (
 	maxRegistrations = 1024
 )
 
+var errRouteConflict = errors.New("route mutation condition is not satisfied")
+
 type persistedState struct {
 	Version int            `json:"version"`
 	Routes  []client.Route `json:"routes"`
@@ -57,7 +59,7 @@ func openRegistry(stateDir string, table *routes.Table) (*registry, error) {
 		return nil, err
 	}
 	for _, registration := range state.Routes {
-		if err := registration.Validate(); err != nil {
+		if err := registration.ValidateForTLD(table.Options().TLD); err != nil {
 			return nil, fmt.Errorf("invalid persisted route %q: %w", registration.Name, err)
 		}
 		if _, exists := r.records[registration.Name]; exists {
@@ -74,13 +76,17 @@ func openRegistry(stateDir string, table *routes.Table) (*registry, error) {
 	return r, nil
 }
 
-func (r *registry) set(registration client.Route, active bool) error {
-	if err := registration.Validate(); err != nil {
+func (r *registry) set(registration client.Route, active bool, match client.RouteMatch, expectedOwner *client.Owner) error {
+	if err := registration.ValidateForTLD(r.table.Options().TLD); err != nil {
 		return err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.records[registration.Name]; !exists && len(r.records) >= maxRegistrations {
+	current, exists := r.records[registration.Name]
+	if !routeMutationMatches(current, exists, match, expectedOwner) {
+		return errRouteConflict
+	}
+	if !exists && len(r.records) >= maxRegistrations {
 		return fmt.Errorf("route limit of %d reached", maxRegistrations)
 	}
 	next := cloneRecords(r.records)
@@ -90,10 +96,14 @@ func (r *registry) set(registration client.Route, active bool) error {
 	return r.commitLocked(next, nextActive)
 }
 
-func (r *registry) remove(name string) (bool, error) {
+func (r *registry) remove(name string, match client.RouteMatch, expectedOwner *client.Owner) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.records[name]; !exists {
+	current, exists := r.records[name]
+	if !routeMutationMatches(current, exists, match, expectedOwner) {
+		return false, errRouteConflict
+	}
+	if !exists {
 		return false, nil
 	}
 	next := cloneRecords(r.records)
@@ -113,6 +123,19 @@ func (r *registry) remove(name string) (bool, error) {
 		r.active = intermediate
 	}
 	return true, r.commitLocked(next, nextActive)
+}
+
+func routeMutationMatches(current client.Route, exists bool, match client.RouteMatch, expectedOwner *client.Owner) bool {
+	switch match {
+	case client.RouteMatchAbsent:
+		return !exists && expectedOwner == nil
+	case client.RouteMatchAny:
+		return expectedOwner == nil
+	case client.RouteMatchOwner:
+		return exists && expectedOwner != nil && current.Owner == *expectedOwner
+	default:
+		return false
+	}
 }
 
 func (r *registry) list() []client.Route {
@@ -228,13 +251,21 @@ func buildProxyRoutes(records map[string]client.Route, active map[string]bool) (
 			continue
 		}
 		upstream := registration.Scheme + "://" + net.JoinHostPort(registration.Host, strconv.Itoa(int(registration.Port)))
-		route, err := routes.NewRoute(registration.Name, upstream)
+		route, err := routes.NewRouteForTLD(registration.Name, upstream, registrationTLD(registration.Name))
 		if err != nil {
 			return nil, fmt.Errorf("build proxy route %q: %w", registration.Name, err)
 		}
 		result = append(result, route)
 	}
 	return result, nil
+}
+
+func registrationTLD(name string) string {
+	index := strings.LastIndexByte(name, '.')
+	if index < 0 {
+		return ""
+	}
+	return name[index:]
 }
 
 func readState(path string) (persistedState, error) {
