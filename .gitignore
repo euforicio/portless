@@ -1,0 +1,6 @@
+/bin/
+/dist/
+/.portless/
+*.test
+*.out
+.DS_Store
