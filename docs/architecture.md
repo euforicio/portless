@@ -26,6 +26,8 @@ writes root-owned configuration directly.
 - Preserve ordinary WebSocket upgrades and test HMR-shaped traffic.
 - Determine whether RFC 8441 needs a maintained third-party WebSocket package;
   use the latest stable compatible release only when real tests prove the gap.
+- The implemented protocol and dependency decision is recorded in
+  [proxy-routes.md](proxy-routes.md).
 - Reject unknown hosts, proxy loops, invalid upstreams, and non-loopback
   management access.
 
