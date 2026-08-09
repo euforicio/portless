@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -145,6 +146,142 @@ func TestAuthorityConcurrentIssuanceUsesOneLeaf(t *testing.T) {
 		if serial != first {
 			t.Fatalf("concurrent issuance returned %s and %s", first, serial)
 		}
+	}
+}
+
+func TestAuthorityBoundsExactHostLeafCache(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pki")
+	registered := map[string]bool{
+		"alpha.local": true,
+		"beta.local":  true,
+		"gamma.local": true,
+	}
+	authority, err := Open(dir, Options{
+		AllowedSuffix:       ".local",
+		MaxLeafCertificates: 2,
+		AllowHost:           func(host string) bool { return registered[host] },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"alpha.local", "beta.local", "gamma.local"} {
+		certificate, err := authority.Certificate(host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(certificate.Leaf.DNSNames) != 1 || certificate.Leaf.DNSNames[0] != host {
+			t.Fatalf("certificate for %q has SANs %v", host, certificate.Leaf.DNSNames)
+		}
+	}
+	assertLeafCacheHosts(t, dir, "beta.local", "gamma.local")
+	if len(authority.leafBySN) != 2 {
+		t.Fatalf("memory cache contains %d leaves, want 2", len(authority.leafBySN))
+	}
+	if _, present := authority.leafBySN["alpha.local"]; present {
+		t.Fatal("deterministic oldest leaf remains in memory after eviction")
+	}
+
+	if _, err := authority.Certificate("unknown.local"); err == nil {
+		t.Fatal("unregistered hostname was issued a certificate")
+	}
+	assertLeafCacheHosts(t, dir, "beta.local", "gamma.local")
+}
+
+func TestAuthorityReopenReconcilesLeafCacheBound(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pki")
+	authority, err := Open(dir, Options{AllowedSuffix: ".local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts := []string{"alpha.local", "beta.local", "gamma.local", "omega.local"}
+	for index, host := range hosts {
+		if _, err := authority.Certificate(host); err != nil {
+			t.Fatal(err)
+		}
+		stamp := time.Unix(1_700_000_000+int64(index), 0)
+		path := filepath.Join(dir, leafDirName, host+".pem")
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reopened, err := Open(dir, Options{AllowedSuffix: ".local", MaxLeafCertificates: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertLeafCacheHosts(t, dir, "gamma.local", "omega.local")
+	if len(reopened.leafBySN) != 0 {
+		t.Fatalf("reopened memory cache contains %d leaves before use", len(reopened.leafBySN))
+	}
+	for _, host := range []string{"gamma.local", "omega.local"} {
+		if _, err := reopened.Certificate(host); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(reopened.leafBySN) != 2 {
+		t.Fatalf("reopened memory cache contains %d leaves, want 2", len(reopened.leafBySN))
+	}
+}
+
+func TestBoundedAuthorityFailsClosedOnUnsafeLeafCacheEntries(t *testing.T) {
+	tests := []struct {
+		name  string
+		write func(*testing.T, string)
+	}{
+		{
+			name: "symlink",
+			write: func(t *testing.T, path string) {
+				target := filepath.Join(t.TempDir(), "target.pem")
+				if err := os.WriteFile(target, []byte("not a certificate"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unsafe mode",
+			write: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("not a certificate"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "invalid certificate",
+			write: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("not a certificate"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unowned name",
+			write: func(t *testing.T, path string) {
+				if err := os.WriteFile(filepath.Dir(path)+"/notes", []byte("unrelated"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "pki")
+			if _, err := Open(dir, Options{AllowedSuffix: ".local"}); err != nil {
+				t.Fatal(err)
+			}
+			test.write(t, filepath.Join(dir, leafDirName, "unsafe.local.pem"))
+			if _, err := Open(dir, Options{AllowedSuffix: ".local", MaxLeafCertificates: 1}); err == nil {
+				t.Fatal("bounded authority accepted an unsafe cache entry")
+			}
+		})
+	}
+}
+
+func TestAuthorityRejectsNegativeLeafCacheBound(t *testing.T) {
+	if _, err := Open(filepath.Join(t.TempDir(), "pki"), Options{MaxLeafCertificates: -1}); err == nil {
+		t.Fatal("negative leaf cache bound was accepted")
 	}
 }
 
@@ -334,6 +471,21 @@ func assertMode(t *testing.T, path string, want os.FileMode) {
 	}
 	if info.Mode().Perm() != want {
 		t.Fatalf("%s mode = %04o, want %04o", path, info.Mode().Perm(), want)
+	}
+}
+
+func assertLeafCacheHosts(t *testing.T, dir string, want ...string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, leafDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		got = append(got, strings.TrimSuffix(entry.Name(), ".pem"))
+	}
+	if !equalStrings(got, want) {
+		t.Fatalf("leaf cache hosts = %q, want %q", got, want)
 	}
 }
 

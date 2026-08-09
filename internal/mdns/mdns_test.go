@@ -22,7 +22,7 @@ func TestCheckBuildsExplicitDNSServiceDiscoveryPlan(t *testing.T) {
 	if preflight.Config.Host != "fieldnotes.local" || preflight.Config.Address != address.Unmap() {
 		t.Fatalf("normalized config = %#v", preflight.Config)
 	}
-	want := []string{"-P", "fieldnotes", "_https._tcp", "local.", "443", "fieldnotes.local.", address.Unmap().String(), "path=/"}
+	want := []string{"-i", strconv.Itoa(preflight.Index), "-P", "fieldnotes", "_https._tcp", "local.", "443", "fieldnotes.local.", address.Unmap().String(), "path=/"}
 	if strings.Join(preflight.Command.Args, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("command args = %q, want %q", preflight.Command.Args, want)
 	}
@@ -36,7 +36,7 @@ func TestCheckRejectsUnsafeNamesAddressesAndPorts(t *testing.T) {
 	tests := []Config{
 		{Host: "fieldnotes.local", Address: validAddress},
 		{Host: "fieldnotes.localhost", Address: validAddress, Port: 443},
-		{Host: "a.b.local", Address: validAddress, Port: 443},
+		{Host: "a..b.local", Address: validAddress, Port: 443},
 		{Host: "-bad.local", Address: validAddress, Port: 443},
 		{Host: "bad name.local", Address: validAddress, Port: 443},
 		{Host: "fieldnotes.local", Address: netip.MustParseAddr("127.0.0.1"), Port: 443},
@@ -103,6 +103,35 @@ func TestStartHonorsCanceledContextBeforeSpawning(t *testing.T) {
 	_, err := Start(ctx, Config{Host: "portless-canceled.local", Address: address, Port: 443})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Start error = %v, want context canceled", err)
+	}
+}
+
+func TestStopOwnedTerminatesOnlyExactRealDNSSDIdentity(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("dns-sd integration requires macOS")
+	}
+	if _, err := os.Stat(Executable); err != nil {
+		t.Skipf("dns-sd is unavailable: %v", err)
+	}
+	address := testLANAddresses(t)[0]
+	publisher, err := Start(t.Context(), Config{
+		Host:    "portless-owned-" + strconv.FormatInt(time.Now().UnixNano(), 36) + ".local",
+		Address: address, Port: 65431, Protocol: HTTP, ReadyTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := publisher.Identity()
+	if err := StopOwned(identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.Close(); err != nil {
+		t.Fatal(err)
+	}
+	changed := identity
+	changed.Start++
+	if err := StopOwned(changed); err != nil {
+		t.Fatalf("gone PID with stale identity should be harmless: %v", err)
 	}
 }
 

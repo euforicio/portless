@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/euforicio/portless/internal/client"
+	"github.com/euforicio/portless/internal/lan"
 	"github.com/euforicio/portless/internal/projectconfig"
 	"github.com/euforicio/portless/internal/runner"
 	"github.com/euforicio/portless/internal/tailscale"
@@ -43,6 +45,8 @@ type runOptions struct {
 	appPort   uint
 	force     bool
 	lan       bool
+	https     bool
+	ip        string
 	tailscale bool
 	funnel    bool
 	command   []string
@@ -55,9 +59,6 @@ func runProject(ctx context.Context, management client.Client, args []string, st
 	options, err := parseRunOptions(args, stderr, shorthand)
 	if err != nil {
 		return err
-	}
-	if options.lan {
-		return errors.New("--lan requires an explicit LAN listener profile; configure it with portless proxy start before running")
 	}
 
 	workingDirectory, err := os.Getwd()
@@ -157,6 +158,7 @@ func runProject(ctx context.Context, management client.Client, args []string, st
 	var registered client.Route
 	var sharingClient tailscale.Client
 	var sharingPlan *tailscale.Plan
+	var lanService *lan.Service
 	if proxyEnabled {
 		endpoint := process.Endpoint()
 		requested := client.Route{
@@ -182,6 +184,52 @@ func runProject(ctx context.Context, management client.Client, args []string, st
 		}
 		registered = *added.Route
 		fmt.Fprintln(stdout, process.Endpoint().URL)
+		if options.lan {
+			lanTarget := "http://" + net.JoinHostPort(endpoint.Host, strconv.Itoa(int(endpoint.Port)))
+			var pinnedIP netip.Addr
+			if options.ip != "" {
+				pinnedIP, err = netip.ParseAddr(options.ip)
+				if err != nil || pinnedIP.Unmap().String() != options.ip {
+					_ = cleanupRoute(context.WithoutCancel(ctx), management, registered)
+					_ = process.Signal(syscall.SIGTERM)
+					_, _ = process.Wait()
+					return errors.New("--ip must be a canonical literal LAN address")
+				}
+			}
+			lanName := strings.TrimSuffix(name, profileStatus.TLD)
+			lanService, err = lan.Start(ctx, lan.Request{
+				Name: lanName, Target: lanTarget, HTTPS: options.https, PinnedIP: pinnedIP,
+				StateDir: runnerStateDirectory(),
+				Authorize: func(checkContext context.Context) bool {
+					current, currentErr := currentRoute(checkContext, management, registered.Name)
+					return currentErr == nil && current == registered
+				},
+				OnUpdate: func(registration lan.Registration) error {
+					current, currentErr := currentRoute(context.WithoutCancel(ctx), management, registered.Name)
+					if currentErr != nil || current != registered {
+						return nil
+					}
+					return updateOwnedLAN(process.Identity(), registration)
+				},
+			})
+			if err != nil {
+				_ = cleanupRoute(context.WithoutCancel(ctx), management, registered)
+				_ = process.Signal(syscall.SIGTERM)
+				_, _ = process.Wait()
+				return fmt.Errorf("configure LAN exposure: %w", err)
+			}
+			registration := lanService.Registration()
+			fmt.Fprintln(stdout, registration.URL())
+			fmt.Fprintf(stderr, "portless: LAN exposure is reachable by subnet peers and has no access control\n")
+			if options.https {
+				fmt.Fprintf(stderr, "portless: other devices do not automatically trust this CA; explicitly install %s on each client you choose to trust\n", registration.CACertPath)
+			}
+			go func() {
+				for lanErr := range lanService.Errors() {
+					fmt.Fprintf(stderr, "portless: LAN exposure warning: %v\n", lanErr)
+				}
+			}()
+		}
 		if options.tailscale || options.funnel {
 			mode := tailscale.Serve
 			if options.funnel {
@@ -218,6 +266,14 @@ func runProject(ctx context.Context, management client.Client, args []string, st
 	}
 
 	result, waitErr := process.Wait()
+	if lanService != nil {
+		registration := lanService.Registration()
+		if lanErr := lanService.Close(); lanErr != nil {
+			fmt.Fprintf(stderr, "portless: LAN cleanup deferred: %v\n", lanErr)
+		} else if stateErr := removeOwnedLAN(process.Identity(), registration.Name); stateErr != nil {
+			fmt.Fprintf(stderr, "portless: LAN state cleanup deferred: %v\n", stateErr)
+		}
+	}
 	if sharingPlan != nil {
 		cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		if shareErr := sharingClient.Clean(cleanupContext, *sharingPlan); shareErr != nil {
@@ -258,6 +314,8 @@ func parseRunOptions(args []string, stderr io.Writer, shorthand bool) (runOption
 	flags.UintVar(&options.appPort, "app-port", 0, "fixed application TCP port")
 	flags.BoolVar(&options.force, "force", false, "replace an exact runner-owned process")
 	flags.BoolVar(&options.lan, "lan", false, "explicitly publish on the local network")
+	flags.BoolVar(&options.https, "https", false, "serve an explicitly enabled LAN route with exact-host HTTPS")
+	flags.StringVar(&options.ip, "ip", "", "pin an explicitly enabled LAN route to one eligible address")
 	flags.BoolVar(&options.tailscale, "tailscale", false, "explicitly publish with Tailscale Serve")
 	flags.BoolVar(&options.funnel, "funnel", false, "explicitly publish with Tailscale Funnel")
 	if err := flags.Parse(args); err != nil {
@@ -269,6 +327,9 @@ func parseRunOptions(args []string, stderr io.Writer, shorthand bool) (runOption
 	}
 	if options.tailscale && options.funnel {
 		return options, errors.New("--tailscale and --funnel are mutually exclusive")
+	}
+	if !options.lan && (options.https || options.ip != "") {
+		return options, errors.New("--https and --ip require --lan")
 	}
 	return options, nil
 }

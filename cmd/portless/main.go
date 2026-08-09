@@ -622,12 +622,26 @@ func list(ctx context.Context, management client.Client, args []string, stdout i
 		return shareErr
 	}
 	sharedURLs := make(map[string]string, len(shares))
+	lanExposures, lanErr := ownedLANExposures()
+	if lanErr != nil {
+		return lanErr
+	}
+	for _, exposure := range lanExposures {
+		label := strings.TrimSuffix(exposure.Registration.Name, ".local")
+		if lanURL := exposure.Registration.URL(); lanURL != "" {
+			sharedURLs[label] = lanURL
+		}
+	}
 	for _, share := range shares {
 		authority := share.Plan.Registration.Host
 		if share.Plan.Registration.Port != 443 {
 			authority = net.JoinHostPort(authority, strconv.Itoa(int(share.Plan.Registration.Port)))
 		}
-		sharedURLs[share.Plan.Registration.Name] = "https://" + authority
+		value := "https://" + authority
+		if existing := sharedURLs[share.Plan.Registration.Name]; existing != "" {
+			value = existing + ", " + value
+		}
+		sharedURLs[share.Plan.Registration.Name] = value
 	}
 	fmt.Fprintln(writer, "NAME\tURL\tSHARED\tOWNER\tUPSTREAM\tREFRESH")
 	for _, route := range response.Routes {

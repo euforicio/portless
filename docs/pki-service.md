@@ -24,8 +24,17 @@ must be exact ASCII DNS names under `.localhost`; an `AllowHost` callback ties
 issuance to the current registered-route snapshot.
 
 Leaves are cached in memory and on disk, are bounded by the active root's
-expiry, and renew once they enter the configured renewal window. Root rotation
-is deliberately two phase because trust is external:
+expiry, and renew once they enter the configured renewal window.
+
+The opt-in LAN authority uses the same exact-host implementation with `.local`
+as its allowed suffix and a hard 256-leaf disk/memory bound. Eviction is
+deterministic by file modification time and hostname, unsafe cache entries fail
+closed, and issuance is permitted only for the current exact LAN registration.
+It never issues wildcard certificates. This user-owned CA is not automatically
+trusted by other devices; LAN HTTPS output identifies the public certificate
+that the user must explicitly install on each intended client.
+
+Root rotation is deliberately two phase because trust is external:
 
 1. `PrepareRootRotation` writes an inactive root and returns its exact SHA-256
    fingerprint and public certificate path.

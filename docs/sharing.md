@@ -15,17 +15,18 @@ uses the same target/mode/path verification. Portless never uses a global reset.
 
 ## LAN names with mDNS
 
-`internal/mdns` publishes one exact, single-label HTTPS name such as
+`internal/mdns` publishes one exact HTTP or HTTPS name such as
 `fieldnotes.local` through macOS `/usr/bin/dns-sd`. `Check` is read-only: it
 normalizes the name, validates the port, and requires the selected private
 unicast address to be assigned to an up, multicast-capable, non-point-to-point
 interface. Loopback, link-local, public, multicast, unspecified, and VPN-style
 point-to-point addresses fail closed.
 
-The returned command plan uses DNS-SD proxy registration:
+The returned command plan scopes DNS-SD proxy registration to the selected
+interface and uses `_http._tcp` or `_https._tcp` as appropriate:
 
 ```text
-/usr/bin/dns-sd -P fieldnotes _https._tcp local. 443 fieldnotes.local. 192.168.1.20 path=/
+/usr/bin/dns-sd -i 4 -P fieldnotes _http._tcp local. 52173 fieldnotes.local. 192.168.1.20 path=/
 ```
 
 `Start` is the explicit exposure boundary. It waits for both the hostname
@@ -34,11 +35,26 @@ revalidates the selected address against current interfaces and replaces the
 child only when the address changed. `Close` sends `SIGTERM`, waits for DNS-SD
 to deregister, bounds shutdown, and is idempotent.
 
-This advertises a name and HTTPS service; the caller remains responsible for
-ensuring the selected LAN address and port reach the intended generic route.
-The user-facing `--lan` flag therefore fails closed today. The publisher alone
-cannot make a loopback listener reachable, and the generated `.localhost` CA
-cannot truthfully certify an advertised `.local` origin.
+`internal/lan` pairs the advertisement with a listener bound to exactly that
+address. It creates an exact `.local` route table over the ordinary validated
+upstream, preserving streaming, safe redirect rewriting, HTTP/2 for HTTPS, and
+ordinary HTTP/1.1 WebSockets. Automatic selection is stable by interface
+index, address family, and address. A replacement listener is bound before the
+old advertisement is withdrawn; the new advertisement must become ready before
+the old listener is drained. If an address disappears without a replacement,
+the advertisement and listener are withdrawn and retried.
+
+LAN state records only the runner identity, exact listener/advertisement data,
+and the `dns-sd` PID plus kernel start identity. Normal shutdown removes it.
+After a supervisor crash, `prune` and confirmed `clean` signal only that exact
+owned process; they never scan for or stop unrelated `dns-sd` instances.
+
+HTTPS uses a separate user-owned LAN CA and exact single-SAN leaves. The leaf
+cache is durably bounded to 256 entries with deterministic eviction; wildcard
+`.local` certificates are never issued. Trust does not propagate to phones,
+tablets, or other computers: the user must explicitly transfer and install the
+printed public CA on each intended client. LAN provides no access control and
+therefore exposes the application to peers on the selected subnet.
 
 ## Tailscale Serve and Funnel
 
