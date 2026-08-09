@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/euforicio/portless/internal/profile"
 )
 
 func TestLaunchDaemonPlistPassesNativeValidation(t *testing.T) {
@@ -64,6 +66,28 @@ func TestLaunchDaemonRejectsRelativeContainerExecutable(t *testing.T) {
 	config.ContainerExecutable = "container"
 	if _, err := config.Plist(); err == nil {
 		t.Fatal("relative container executable was accepted")
+	}
+}
+
+func TestLaunchDaemonPersistsCustomProfileWithoutLegacyTLSListeners(t *testing.T) {
+	config := temporaryConfig(t)
+	config.ContainerExecutable = ""
+	config.Profile = &profile.Config{
+		Scheme: profile.HTTP, ListenAddress: "127.0.0.1:8080", TLD: ".test",
+	}
+	plist, err := config.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"--scheme", "http", "--listen", "127.0.0.1:8080", "--tld", ".test", "--reconcile-profile"} {
+		if !bytes.Contains(plist, []byte("<string>"+required+"</string>")) {
+			t.Fatalf("custom profile plist is missing %q", required)
+		}
+	}
+	for _, omitted := range []string{"--container-cli", "--https-listen", "--http-listen"} {
+		if bytes.Contains(plist, []byte("<string>"+omitted+"</string>")) {
+			t.Fatalf("custom HTTP profile unexpectedly contains %q", omitted)
+		}
 	}
 }
 

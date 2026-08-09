@@ -14,6 +14,7 @@ import (
 
 	"github.com/euforicio/portless/internal/client"
 	"github.com/euforicio/portless/internal/pki"
+	"github.com/euforicio/portless/internal/profile"
 	"github.com/euforicio/portless/internal/service"
 )
 
@@ -155,20 +156,41 @@ func (r *Runtime) executeRequest(ctx context.Context, peer service.PeerCredentia
 			registration.Owner.Network = endpoint.Network
 			registration.Owner.InspectorUID = peer.UID
 		}
-		if err := registration.Validate(); err != nil {
+		if err := registration.ValidateForTLD(r.table.Options().TLD); err != nil {
 			return client.Response{}, operationError{code: "invalid_request", message: err.Error()}
 		}
-		if err := r.registry.set(registration, true); err != nil {
+		if err := r.registry.set(registration, true, request.Match, request.ExpectedOwner); err != nil {
+			if errors.Is(err, errRouteConflict) {
+				return client.Response{}, operationError{code: "route_conflict", message: "route changed or does not satisfy the requested mutation condition"}
+			}
 			return client.Response{}, err
 		}
+		success.Route = &registration
 	case client.OperationRemove:
-		if _, err := r.registry.remove(request.Name); err != nil {
+		if _, err := r.registry.remove(request.Name, request.Match, request.ExpectedOwner); err != nil {
+			if errors.Is(err, errRouteConflict) {
+				return client.Response{}, operationError{code: "route_conflict", message: "route changed or does not satisfy the requested mutation condition"}
+			}
 			return client.Response{}, err
 		}
 	case client.OperationList:
 		success.Routes = r.registry.list()
 	case client.OperationStatus:
 		success.Status = &client.Status{Running: true, Version: r.config.Version, SocketPath: r.config.ManagementSocket}
+		if r.publicProfile != nil {
+			success.Status.Scheme = string(r.publicProfile.Scheme())
+			success.Status.ListenAddress = r.publicProfile.ListenAddress()
+			success.Status.TLD = r.publicProfile.TLD()
+			success.Status.WildcardFallback = r.publicProfile.RouteOptions().WildcardFallback
+			success.Status.CertificateMode = string(r.config.Profile.Certificates.Mode)
+			success.Status.CertificateFile = r.config.Profile.Certificates.CertFile
+			success.Status.KeyFile = r.config.Profile.Certificates.KeyFile
+		} else {
+			success.Status.Scheme = "https"
+			success.Status.ListenAddress = "127.0.0.1:443"
+			success.Status.TLD = ".localhost"
+			success.Status.CertificateMode = string(profile.GeneratedCertificates)
+		}
 	case client.OperationDoctor:
 		success.Diagnostics = r.doctor(ctx)
 	case client.OperationRefresh:
@@ -191,19 +213,23 @@ func (r *Runtime) doctor(ctx context.Context) []client.Diagnostic {
 		{Name: "management-socket", Level: "ok", Message: r.config.ManagementSocket},
 		{Name: "routes", Level: "ok", Message: fmt.Sprintf("%d registrations", len(r.registry.list()))},
 	}
-	if info, err := os.Stat(r.config.ContainerCLI); err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
-		diagnostics = append(diagnostics, client.Diagnostic{Name: "apple-container", Level: "warning", Message: "container executable is unavailable"})
-	} else {
-		diagnostics = append(diagnostics, client.Diagnostic{Name: "apple-container", Level: "ok", Message: r.config.ContainerCLI})
+	if r.config.ContainerCLI != "" {
+		if info, err := os.Stat(r.config.ContainerCLI); err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			diagnostics = append(diagnostics, client.Diagnostic{Name: "apple-container", Level: "warning", Message: "optional Apple container adapter is unavailable"})
+		} else {
+			diagnostics = append(diagnostics, client.Diagnostic{Name: "apple-container", Level: "ok", Message: r.config.ContainerCLI})
+		}
 	}
-	trusted, err := pki.SystemTrusted(ctx, r.authority.RootCertificatePath())
-	switch {
-	case err != nil:
-		diagnostics = append(diagnostics, client.Diagnostic{Name: "ca-trust", Level: "warning", Message: "could not inspect system trust"})
-	case trusted:
-		diagnostics = append(diagnostics, client.Diagnostic{Name: "ca-trust", Level: "ok", Message: "root certificate is trusted"})
-	default:
-		diagnostics = append(diagnostics, client.Diagnostic{Name: "ca-trust", Level: "warning", Message: "root certificate is not trusted"})
+	if r.authority != nil {
+		trusted, err := pki.SystemTrusted(ctx, r.authority.RootCertificatePath())
+		switch {
+		case err != nil:
+			diagnostics = append(diagnostics, client.Diagnostic{Name: "ca-trust", Level: "warning", Message: "could not inspect system trust"})
+		case trusted:
+			diagnostics = append(diagnostics, client.Diagnostic{Name: "ca-trust", Level: "ok", Message: "root certificate is trusted"})
+		default:
+			diagnostics = append(diagnostics, client.Diagnostic{Name: "ca-trust", Level: "warning", Message: "root certificate is not trusted"})
+		}
 	}
 	refreshDiagnostics, err := r.Refresh(ctx)
 	if err != nil {

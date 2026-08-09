@@ -5,11 +5,16 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/euforicio/portless/internal/profile"
+	"github.com/euforicio/portless/internal/routes"
 )
 
 const DefaultLabel = "com.euforicio.portless"
@@ -31,6 +36,7 @@ type Config struct {
 	HTTPSListeners      []string
 	UID                 int
 	GID                 int
+	Profile             *profile.Config
 }
 
 // DefaultConfig returns the fixed production layout. The management group is
@@ -71,10 +77,46 @@ func (c Config) validate() error {
 		"executable": c.Executable, "plist": c.PlistPath, "state directory": c.StateDir,
 		"runtime directory": c.RuntimeDir, "management socket": c.ManagementSocket,
 		"stdout": c.StdoutPath, "stderr": c.StderrPath,
-		"container executable": c.ContainerExecutable,
 	} {
 		if !filepath.IsAbs(path) || strings.ContainsRune(path, '\x00') {
 			return fmt.Errorf("%s path must be absolute", name)
+		}
+	}
+	if c.ContainerExecutable != "" && (!filepath.IsAbs(c.ContainerExecutable) || strings.ContainsRune(c.ContainerExecutable, '\x00')) {
+		return errors.New("container executable path must be absolute when configured")
+	}
+	if c.Profile != nil {
+		if c.Profile.Scheme != profile.HTTP && c.Profile.Scheme != profile.HTTPS {
+			return errors.New("invalid service profile scheme")
+		}
+		if _, err := routes.NormalizeTLD(c.Profile.TLD); err != nil {
+			return err
+		}
+		host, port, err := net.SplitHostPort(c.Profile.ListenAddress)
+		address, addressErr := netip.ParseAddr(host)
+		portNumber, portErr := strconv.ParseUint(port, 10, 16)
+		if err != nil || addressErr != nil || !address.IsLoopback() || portErr != nil || portNumber == 0 {
+			return errors.New("service profile requires a literal nonzero loopback listener")
+		}
+		if c.Profile.Scheme == profile.HTTPS && c.Profile.WildcardFallback && c.Profile.Certificates.Mode == profile.GeneratedCertificates {
+			return errors.New("generated certificates cannot enable wildcard fallback")
+		}
+		if c.Profile.Scheme == profile.HTTP && c.Profile.Certificates != (profile.CertificateConfig{}) {
+			return errors.New("plain HTTP service profile cannot contain certificates")
+		}
+		if c.Profile.Scheme == profile.HTTPS {
+			switch c.Profile.Certificates.Mode {
+			case profile.GeneratedCertificates:
+				if c.Profile.Certificates.CertFile != "" || c.Profile.Certificates.KeyFile != "" {
+					return errors.New("generated profile cannot contain certificate paths")
+				}
+			case profile.CertificateFiles:
+				if c.Profile.Certificates.CertFile == c.Profile.Certificates.KeyFile || !filepath.IsAbs(c.Profile.Certificates.CertFile) || !filepath.IsAbs(c.Profile.Certificates.KeyFile) {
+					return errors.New("profile certificate paths must be distinct and absolute")
+				}
+			default:
+				return errors.New("HTTPS service profile requires a certificate mode")
+			}
 		}
 	}
 	if filepath.Dir(c.ManagementSocket) != filepath.Clean(c.RuntimeDir) {
@@ -120,13 +162,33 @@ func (c Config) Plist() ([]byte, error) {
 		"--state-dir", c.StateDir,
 		"--management-socket", c.ManagementSocket,
 		"--management-group", c.ManagementGroup,
-		"--container-cli", c.ContainerExecutable,
 	}
-	for _, address := range c.HTTPListeners {
-		arguments = append(arguments, "--http-listen", address)
+	if c.ContainerExecutable != "" {
+		arguments = append(arguments, "--container-cli", c.ContainerExecutable)
 	}
-	for _, address := range c.HTTPSListeners {
-		arguments = append(arguments, "--https-listen", address)
+	if c.Profile != nil {
+		arguments = append(arguments,
+			"--scheme", string(c.Profile.Scheme),
+			"--listen", c.Profile.ListenAddress,
+			"--tld", c.Profile.TLD,
+			"--reconcile-profile",
+		)
+		if c.Profile.WildcardFallback {
+			arguments = append(arguments, "--wildcard")
+		}
+		if c.Profile.Certificates.Mode == profile.CertificateFiles {
+			arguments = append(arguments, "--cert", c.Profile.Certificates.CertFile, "--key", c.Profile.Certificates.KeyFile)
+		}
+	}
+	if c.Profile == nil || c.Profile.Scheme == profile.HTTPS {
+		for _, address := range c.HTTPListeners {
+			arguments = append(arguments, "--http-listen", address)
+		}
+	}
+	if c.Profile == nil {
+		for _, address := range c.HTTPSListeners {
+			arguments = append(arguments, "--https-listen", address)
+		}
 	}
 
 	var out bytes.Buffer
@@ -156,7 +218,7 @@ func defaultContainerExecutable() string {
 			return candidate
 		}
 	}
-	return "/usr/local/bin/container"
+	return ""
 }
 
 func isLoopbackListener(address string, wantedPort uint64) bool {

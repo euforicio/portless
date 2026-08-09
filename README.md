@@ -1,79 +1,120 @@
 # portless
 
-Portless is a native Go local-domain proxy and Apple-container router for
-macOS. It gives local applications stable HTTPS names such as
-`https://fieldnotes.localhost` while keeping changing ports and container
-addresses behind one loopback-only daemon.
+Portless is a small macOS-native Go proxy for stable local application names.
+It maps validated IP-and-port upstreams to origins such as
+`https://fieldnotes.localhost`. Local processes and host ports published by
+Docker, Podman, Apple Container, Lima, or another runtime use the same routing
+core; no container runtime is required.
 
-## Install and operate
+## Initialize once
 
-Build with Go 1.26.5 or a newer Go 1.26 release, then perform the one explicit
-privileged bootstrap:
+Build with Go 1.26.5 or a newer Go 1.26 release, then run init as your ordinary
+macOS user:
 
 ```sh
 go build -o portless ./cmd/portless
-sudo ./portless install --management-group admin \
-  --container-cli /opt/homebrew/bin/container
+./portless init
+# or install a custom persisted profile
+./portless init --scheme http --listen 127.0.0.1:8080 --tld .test
 ```
 
-`install` does not require an existing management socket. It atomically installs
-the current executable and LaunchDaemon property list, creates the local CA,
-adds that exact CA to the system trust store, starts the service through
-`launchctl`, and waits for the management socket to answer. Repeating `install`
-is safe. Use `sudo ./portless upgrade` to reconcile a newer executable.
+`init` performs read-only platform, management-group, daemon, port, and
+privilege-helper checks. A healthy same-version rerun returns without invoking
+`sudo`. When reconciliation is needed it invokes fixed `/usr/bin/sudo` once to
+run the auditable installer, installs or upgrades the binary and LaunchDaemon,
+creates and trusts the local CA, starts the service, waits for the management
+socket, and runs doctor again from the original user process.
 
-After installation, route operations are unprivileged and never invoke `sudo`,
-`launchctl`, or `security`:
+`install`, `upgrade`, and `uninstall` remain advanced root-only lifecycle
+commands. The default management socket is
+`/var/run/portless/management.sock`; `PORTLESS_SOCKET` selects an alternate
+absolute test or foreground-development socket.
+
+## Run any command
+
+Portless executes an argv vector directly. It does not invoke a shell, inspect
+package managers, read `package.json`, infer frameworks, or understand
+workspaces or Turborepo.
 
 ```sh
-portless add fieldnotes --port 3000
-portless add api --port 8080 --pid "$PID"
-portless add dashboard --container dashboard --port 80
-portless list
-portless status
-portless doctor
-portless refresh
-portless remove fieldnotes
+portless run --name fieldnotes -- go run ./cmd/server
+portless run --name api --app-port 8080 -- ./api-server
+portless fieldnotes go run ./cmd/server
+portless                         # uses the nearest validated portless.json
 ```
 
-The management socket is `/var/run/portless/management.sock` and is accessible
-only to root and the selected management group. `PORTLESS_SOCKET` selects an
-alternate absolute socket for development and integration tests.
+The child receives `PORT`, `HOST`, `PORTLESS_URL`, and, when the installed
+public CA file is readable, `NODE_EXTRA_CA_CERTS`. The latter is compatibility
+metadata only and does not imply Node.js behavior. Dynamic and fixed ports are
+supported. Signals are forwarded to an identity-checked child process group,
+the exact child exit status is returned, and the process-owned route is removed
+only when its daemon-canonical owner still matches. `--force` can take over only
+an exact live runner record and uses protocol compare-and-set replacement.
 
-`sudo portless uninstall` stops launchd, removes the exact trusted CA, binary,
-property list, and socket. It deliberately retains route state, certificates,
-and logs for recovery. Destructive state removal is not exposed by the ordinary
-CLI.
+`--tailscale` and `--funnel` are explicit per-run exposure boundaries. They use
+the official CLI's live capabilities, apply one root-mounted registration, and
+remove only that exact registration when the run ends. They never use `sudo`.
+`--lan` currently fails closed: the mDNS foundation is implemented and tested,
+but advertising a `.local` HTTPS name without a matching certificate and LAN
+listener would be misleading and insecure.
 
-## Runtime behavior
+Example `portless.json`:
 
-- HTTP on loopback port 80 redirects only registered exact hosts to HTTPS with
-  a method-preserving 308 response.
-- HTTPS on loopback port 443 uses an exact-host SNI certificate and rejects an
-  SNI/Host mismatch.
-- The proxy supports streaming, HTTP/2 client access, HTTPS upstreams, safe
-  redirect rewriting, and ordinary HTTP/1.1 WebSocket/HMR upgrades.
-- Route registrations are strictly validated and atomically persisted at
-  `/Library/Application Support/Portless/routes.json`.
-- The daemon independently re-inspects every container registration. A stopped,
-  missing, ambiguous, or unverifiable container is removed from the active
-  proxy table while its registration is retained for later recovery.
-- Container inspection is tied to the kernel-authenticated login UID that added
-  the route. The root daemon enters that user's launchd bootstrap domain through
-  `/bin/launchctl asuser` and drops UID/GID before executing the user's absolute
-  Apple `container` CLI. Root cannot register a container-owned route.
-- Process-owned routes include a Darwin process-start identity and are removed
-  after the exact process exits, including across daemon restarts.
+```json
+{
+  "name": "fieldnotes",
+  "command": ["go", "run", "./cmd/server"],
+  "appPort": 3000,
+  "proxy": true,
+  "env": {"LOG_LEVEL": "debug"}
+}
+```
 
-## Intentional constraints
+## Routes and operation
 
-Portless binds literal `127.0.0.1` and `::1` listeners only. It does not expose
-LAN, tailnet, or public listeners and does not modify `/etc/hosts`. RFC 8441
-HTTP/2 extended-CONNECT WebSockets remain intentionally unsupported because Go
-1.26 does not expose a supported server configuration for them; ordinary
-HTTP/1.1 WebSockets and HTTP/2 request/response traffic are supported.
+```sh
+portless alias dashboard --host 127.0.0.1 --port 3000
+portless alias vm-api --host 192.168.64.8 --port 8080
+portless alias dashboard --host 127.0.0.1 --port 4000 --force
+portless list
+portless remove dashboard
+portless doctor
+portless prune
+portless hosts sync             # read-only plan
+sudo portless hosts sync --apply
+```
 
-See [docs/architecture.md](docs/architecture.md), [docs/cli.md](docs/cli.md),
-[docs/pki-service.md](docs/pki-service.md), and
-[docs/proxy-routes.md](docs/proxy-routes.md) for the security and protocol
-contracts.
+Static aliases accept literal loopback or private-unicast upstreams, making
+runtime-published ports ordinary routes. `add --container ID` remains an
+optional Apple Container discovery convenience and is never called by init,
+run, alias, proxy, list, or sharing paths.
+
+The default proxy preserves exact `.localhost` HTTPS routing on loopback ports
+80/443, method-preserving redirects, HTTP/2 request/response traffic,
+streaming, HTTPS upstreams, redirect rewriting, and HTTP/1.1 WebSockets.
+Custom foreground profiles support one literal loopback listener, HTTP or
+HTTPS, a custom single-label TLD, generated CA or secure certificate/key files,
+and opt-in registered-parent fallback. Generated-CA wildcard fallback is
+rejected because the leaf cache is not durably bounded. The active profile is
+persisted and incompatible daemon restarts fail closed. `init` accepts the same
+profile flags for the installed service; an intentional profile replacement is
+allowed only after every route has been removed.
+
+## Safety boundaries and intentional exclusions
+
+- Default listeners are literal loopback addresses only.
+- Routine run, alias, list, remove, refresh, prune, Serve, and Funnel operations
+  never invoke `sudo`.
+- Trust, LaunchDaemon, privileged ports, `/etc/hosts`, and destructive route
+  cleanup remain explicit boundaries.
+- There is no Linux/Windows behavior and no framework or package-manager
+  integration.
+- RFC 8441 HTTP/2 extended-CONNECT WebSockets are not advertised; Go 1.26 has
+  no supported server configuration for them. HTTP/1.1 WebSockets are tested.
+- Tailscale registrations are durably tied to the runner identity, cleaned
+  exactly on normal and signaled shutdown, and reconciled after a hard crash by
+  `portless prune` or the confirmed `portless clean --routes --yes` boundary.
+
+See [CLI](docs/cli.md), [architecture](docs/architecture.md),
+[profiles](docs/proxy-profiles.md), [runner](docs/runner.md),
+[sharing](docs/sharing.md), and [PKI/service](docs/pki-service.md).

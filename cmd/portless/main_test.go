@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,7 +16,22 @@ import (
 
 	"github.com/euforicio/portless/internal/client"
 	"github.com/euforicio/portless/internal/daemon"
+	"github.com/euforicio/portless/internal/runner"
+	"github.com/euforicio/portless/internal/tailscale"
 )
+
+func TestPortlessRunHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_PORTLESS_RUN_HELPER") != "1" {
+		return
+	}
+	values := map[string]string{
+		"PORT": os.Getenv("PORT"), "HOST": os.Getenv("HOST"),
+		"PORTLESS_URL": os.Getenv("PORTLESS_URL"),
+	}
+	data, _ := json.Marshal(values)
+	_ = os.WriteFile(os.Args[len(os.Args)-1], data, 0o600)
+	os.Exit(7)
+}
 
 func TestCommandSurfaceUsesRealManagementSocket(t *testing.T) {
 	socketPath := startRuntime(t, "/usr/bin/false")
@@ -156,6 +172,58 @@ func TestStatusReportsStoppedWhenSocketIsAbsent(t *testing.T) {
 	}
 	if stdout.String() != "stopped\n" {
 		t.Fatalf("stdout = %q, want stopped", stdout.String())
+	}
+}
+
+func TestGenericRunRegistersCleansAndPreservesExitStatus(t *testing.T) {
+	socketPath := startRuntime(t, "")
+	t.Setenv("PORTLESS_SOCKET", socketPath)
+	t.Setenv("PORTLESS_RUNNER_STATE", filepath.Join(t.TempDir(), "runner"))
+	t.Setenv("GO_WANT_PORTLESS_RUN_HELPER", "1")
+	outputPath := filepath.Join(t.TempDir(), "environment.json")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run(t.Context(), []string{"run", "--name", "generic", "--", os.Args[0], "-test.run=TestPortlessRunHelper", "--", outputPath}, &stdout, &stderr)
+	if code != 7 {
+		t.Fatalf("run code = %d, want 7; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var values map[string]string
+	if err := json.Unmarshal(data, &values); err != nil {
+		t.Fatal(err)
+	}
+	if values["PORT"] == "" || values["HOST"] != "127.0.0.1" || values["PORTLESS_URL"] != "https://generic.localhost" {
+		t.Fatalf("managed environment = %#v", values)
+	}
+	response, err := (client.Client{SocketPath: socketPath}).Call(t.Context(), client.Request{Operation: client.OperationList})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Routes) != 0 {
+		t.Fatalf("route cleanup left %#v", response.Routes)
+	}
+}
+
+func TestOwnedShareStateRoundTrip(t *testing.T) {
+	t.Setenv("PORTLESS_RUNNER_STATE", filepath.Join(t.TempDir(), "runner"))
+	identity := runner.Identity{PID: 42, Start: 99}
+	plan := tailscale.Plan{Registration: tailscale.Registration{Name: "app", Mode: tailscale.Serve, Port: 443, Target: "http://127.0.0.1:3000", Host: "node.example.ts.net"}}
+	if err := addOwnedShare(identity, plan); err != nil {
+		t.Fatal(err)
+	}
+	shares, err := ownedShares()
+	if err != nil || len(shares) != 1 || shares[0].Identity != identity || shares[0].Plan.Registration != plan.Registration {
+		t.Fatalf("shares = %#v, err=%v", shares, err)
+	}
+	if err := removeOwnedShare(identity, plan); err != nil {
+		t.Fatal(err)
+	}
+	shares, err = ownedShares()
+	if err != nil || len(shares) != 0 {
+		t.Fatalf("shares after remove = %#v, err=%v", shares, err)
 	}
 }
 

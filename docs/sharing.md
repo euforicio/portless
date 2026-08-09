@@ -6,6 +6,13 @@ runtime. Local-only `.localhost` routing remains the default. LAN, tailnet, and
 public exposure happen only when a caller deliberately starts or applies the
 corresponding plan.
 
+The CLI composes Tailscale Serve and Funnel with one `run` lifetime: it applies
+only after the child and route exist, prints the shared URL, and calls exact
+`Clean` after normal, failed, or signal-driven child completion. The exact plan
+and runner identity are stored in the user-owned runner state; `prune` cleans a
+share only after that exact process identity is stale, and confirmed `clean`
+uses the same target/mode/path verification. Portless never uses a global reset.
+
 ## LAN names with mDNS
 
 `internal/mdns` publishes one exact, single-label HTTPS name such as
@@ -29,6 +36,9 @@ to deregister, bounds shutdown, and is idempotent.
 
 This advertises a name and HTTPS service; the caller remains responsible for
 ensuring the selected LAN address and port reach the intended generic route.
+The user-facing `--lan` flag therefore fails closed today. The publisher alone
+cannot make a loopback listener reachable, and the generated `.localhost` CA
+cannot truthfully certify an advertised `.local` origin.
 
 ## Tailscale Serve and Funnel
 

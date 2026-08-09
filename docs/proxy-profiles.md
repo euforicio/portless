@@ -82,11 +82,16 @@ The requested child authority remains the public origin for forwarding headers,
 redirect rewriting, and certificate hostname checks. Only the selected route's
 validated upstream endpoint is inherited from its registered parent.
 
-## Integration boundary
+## Daemon integration and persistence
 
-This package set intentionally does not change the current daemon, CLI,
-service manifest, management protocol, or durable registry. Those components
-still compose the default exact `.localhost` profile. A later integration can
-construct one table and proxy handler per profile, pass that table to the
-profile certificate runtime, bind `Profile.Listen`, and serve through
-`Profile.Serve` without adding runtime-specific behavior to the proxy core.
+`internal/daemon` composes `Profile` for a custom listener, constructs the
+matching route table, passes the public port to redirect rewriting, selects the
+generated authority or validated certificate files, and serves through
+`Profile.Listen` and `Profile.Serve`. Plain HTTP profiles use the same route
+table without TLS configuration.
+
+The normalized configuration is stored as strict owner-only `profile.json`.
+An explicitly different scheme, listener, TLD, wildcard policy, or certificate
+source fails before route state is reinterpreted. A non-legacy persisted profile
+is loaded when the service starts without explicit profile flags. The legacy
+default remains a deliberate compatibility composition for dual-stack 80/443.

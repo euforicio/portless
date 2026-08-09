@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
+
+	"github.com/euforicio/portless/internal/routes"
 )
 
-const ProtocolVersion = 1
+const ProtocolVersion = 2
 
 type Operation string
 
@@ -37,12 +39,22 @@ const (
 	RefreshContainerAddress RefreshPolicy = "container-address"
 )
 
+type RouteMatch string
+
+const (
+	RouteMatchAbsent RouteMatch = "absent"
+	RouteMatchAny    RouteMatch = "any"
+	RouteMatchOwner  RouteMatch = "owner"
+)
+
 type Request struct {
-	Version   int       `json:"version"`
-	ID        string    `json:"id"`
-	Operation Operation `json:"operation"`
-	Route     *Route    `json:"route,omitempty"`
-	Name      string    `json:"name,omitempty"`
+	Version       int        `json:"version"`
+	ID            string     `json:"id"`
+	Operation     Operation  `json:"operation"`
+	Route         *Route     `json:"route,omitempty"`
+	Name          string     `json:"name,omitempty"`
+	Match         RouteMatch `json:"match,omitempty"`
+	ExpectedOwner *Owner     `json:"expected_owner,omitempty"`
 }
 
 type Response struct {
@@ -53,6 +65,7 @@ type Response struct {
 	Routes      []Route      `json:"routes,omitempty"`
 	Status      *Status      `json:"status,omitempty"`
 	Diagnostics []Diagnostic `json:"diagnostics,omitempty"`
+	Route       *Route       `json:"route,omitempty"`
 }
 
 type Problem struct {
@@ -79,9 +92,16 @@ type Owner struct {
 }
 
 type Status struct {
-	Running    bool   `json:"running"`
-	Version    string `json:"version,omitempty"`
-	SocketPath string `json:"socket_path,omitempty"`
+	Running          bool   `json:"running"`
+	Version          string `json:"version,omitempty"`
+	SocketPath       string `json:"socket_path,omitempty"`
+	Scheme           string `json:"scheme,omitempty"`
+	ListenAddress    string `json:"listen_address,omitempty"`
+	TLD              string `json:"tld,omitempty"`
+	WildcardFallback bool   `json:"wildcard_fallback,omitempty"`
+	CertificateMode  string `json:"certificate_mode,omitempty"`
+	CertificateFile  string `json:"certificate_file,omitempty"`
+	KeyFile          string `json:"key_file,omitempty"`
 }
 
 type Diagnostic struct {
@@ -106,7 +126,10 @@ func (r Request) Validate() error {
 		if r.Name != "" {
 			return errors.New("add request must not include name")
 		}
-		return r.Route.Validate()
+		if err := r.Route.validateForTLD(""); err != nil {
+			return err
+		}
+		return r.validateMutationMatch(true)
 	case OperationRemove:
 		if r.Route != nil {
 			return errors.New("remove request must not include a route")
@@ -118,8 +141,9 @@ func (r Request) Validate() error {
 		if name != r.Name {
 			return errors.New("remove request name is not canonical")
 		}
+		return r.validateMutationMatch(false)
 	case OperationInstall, OperationList, OperationStatus, OperationDoctor, OperationRefresh, OperationUninstall:
-		if r.Route != nil || r.Name != "" {
+		if r.Route != nil || r.Name != "" || r.Match != "" || r.ExpectedOwner != nil {
 			return fmt.Errorf("%s request must not include route data", r.Operation)
 		}
 	default:
@@ -128,8 +152,50 @@ func (r Request) Validate() error {
 	return nil
 }
 
+func (r Request) validateMutationMatch(allowAbsent bool) error {
+	switch r.Match {
+	case RouteMatchAbsent:
+		if !allowAbsent {
+			return errors.New("remove request cannot require an absent route")
+		}
+		if r.ExpectedOwner != nil {
+			return errors.New("absent route match must not include an expected owner")
+		}
+	case RouteMatchAny:
+		if r.ExpectedOwner != nil {
+			return errors.New("any route match must not include an expected owner")
+		}
+	case RouteMatchOwner:
+		if r.ExpectedOwner == nil {
+			return errors.New("owner route match requires an expected owner")
+		}
+		if err := r.ExpectedOwner.validateExpected(); err != nil {
+			return fmt.Errorf("invalid expected owner: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported route match %q", r.Match)
+	}
+	return nil
+}
+
 func (r Route) Validate() error {
-	name, err := NormalizeName(r.Name)
+	return r.ValidateForTLD(".localhost")
+}
+
+// ValidateForTLD validates a route against the daemon's active DNS namespace.
+func (r Route) ValidateForTLD(tld string) error {
+	return r.validateForTLD(tld)
+}
+
+func (r Route) validateForTLD(tld string) error {
+	if tld == "" {
+		index := strings.LastIndexByte(r.Name, '.')
+		if index <= 0 {
+			return errors.New("route name must include a DNS suffix")
+		}
+		tld = r.Name[index:]
+	}
+	name, err := routes.NormalizeAuthorityForTLD(r.Name, tld)
 	if err != nil {
 		return err
 	}
@@ -149,8 +215,8 @@ func (r Route) Validate() error {
 
 	switch r.Owner.Kind {
 	case OwnerStatic:
-		if !address.IsLoopback() {
-			return errors.New("static routes must target a loopback address")
+		if !address.IsLoopback() && (!address.IsPrivate() || address.IsLinkLocalUnicast()) {
+			return errors.New("static routes must target a loopback or private unicast address")
 		}
 		if r.Owner.PID != 0 || r.Owner.ProcessStart != 0 || r.Owner.InspectorUID != 0 || r.Owner.Container != "" || r.Owner.Network != "" || r.Owner.Refresh != RefreshNever {
 			return errors.New("static route has invalid ownership metadata")
@@ -175,6 +241,26 @@ func (r Route) Validate() error {
 	return nil
 }
 
+func (o Owner) validateExpected() error {
+	switch o.Kind {
+	case OwnerStatic:
+		if o.PID != 0 || o.ProcessStart != 0 || o.InspectorUID != 0 || o.Container != "" || o.Network != "" || o.Refresh != RefreshNever {
+			return errors.New("static owner has invalid ownership metadata")
+		}
+	case OwnerProcess:
+		if o.PID <= 0 || o.ProcessStart <= 0 || o.InspectorUID != 0 || o.Container != "" || o.Network != "" || o.Refresh != RefreshNever {
+			return errors.New("process owner requires an exact process identity")
+		}
+	case OwnerContainer:
+		if o.PID != 0 || o.ProcessStart != 0 || o.InspectorUID == 0 || validateOwnerToken(o.Container) != nil || validateOwnerToken(o.Network) != nil || o.Refresh != RefreshContainerAddress {
+			return errors.New("container owner requires an exact inspector identity")
+		}
+	default:
+		return fmt.Errorf("unsupported route owner %q", o.Kind)
+	}
+	return nil
+}
+
 func validateOwnerToken(value string) error {
 	if len(value) == 0 || len(value) > 128 {
 		return errors.New("owner identifier must be between 1 and 128 characters")
@@ -189,10 +275,19 @@ func validateOwnerToken(value string) error {
 }
 
 func NormalizeName(input string) (string, error) {
+	return NormalizeNameForTLD(input, ".localhost")
+}
+
+// NormalizeNameForTLD accepts one label or a complete name under tld.
+func NormalizeNameForTLD(input, tld string) (string, error) {
+	suffix, err := routes.NormalizeTLD(tld)
+	if err != nil {
+		return "", err
+	}
 	name := strings.ToLower(strings.TrimSpace(input))
 	name = strings.TrimSuffix(name, ".")
-	if strings.HasSuffix(name, ".localhost") {
-		name = strings.TrimSuffix(name, ".localhost")
+	if strings.HasSuffix(name, suffix) {
+		return routes.NormalizeAuthorityForTLD(name, suffix)
 	}
 	if len(name) == 0 || len(name) > 63 {
 		return "", errors.New("route name must be a DNS label between 1 and 63 characters")
@@ -203,7 +298,7 @@ func NormalizeName(input string) (string, error) {
 		}
 		return "", fmt.Errorf("invalid route name %q", input)
 	}
-	return name + ".localhost", nil
+	return name + suffix, nil
 }
 
 func validateID(id string) error {

@@ -1,99 +1,102 @@
-# CLI and Apple container integration
+# CLI contract
 
-The command surface is intentionally small:
+## Commands
 
 ```text
-portless install
-portless add NAME --port PORT [--pid PID] [--protocol http|https]
-portless add NAME --container ID [--port PORT] [--protocol http|https]
-portless remove NAME
+portless init [--management-group GROUP]
+              [--scheme http|https] [--listen LOOPBACK:PORT] [--tld TLD]
+              [--cert FILE --key FILE] [--wildcard]
+portless run [--name NAME] [--app-port PORT] [--force]
+             [--lan] [--tailscale|--funnel] -- COMMAND [ARGS...]
+portless NAME COMMAND [ARGS...]
+portless
+portless alias|add NAME --host IP --port PORT [--protocol http|https] [--force]
+portless add NAME --container ID [--port PORT] [--protocol http|https] [--force]
+portless remove NAME [--force]
 portless list
-portless status
-portless doctor
-portless refresh
-portless uninstall
+portless proxy start [--foreground] [daemon profile flags]
+portless proxy stop|status
+portless service install|status|uninstall
+portless trust status|install|remove
+portless hosts sync|clean [--apply]
+portless prune
+portless clean [--routes --yes]
+portless doctor|refresh|version
 ```
 
-`NAME` is one DNS label. The CLI accepts either `fieldnotes` or
-`fieldnotes.localhost` and sends the canonical `fieldnotes.localhost` name to
-the daemon. Local routes default to `127.0.0.1`; `--host` can select another
-loopback IP. A local route without `--pid` is static. `--pid` makes it
-process-owned, which lets the daemon remove it when that process is no longer
-alive.
+Bare `portless` requires a validated `portless.json`. The shorthand treats the
+first unknown command token as the route name and every remaining token as the
+direct child argv. No form accepts a shell command string.
 
-For an Apple container route, the CLI executes `container inspect ID` directly,
-requires a running container, selects a declared TCP container port, and
-extracts reachable unicast addresses from the running network status. `--port`
-is optional only when exactly one published TCP port is declared. An explicit
-`--port` is treated as the operator's declaration for a direct listener because
-Apple does not expose image `EXPOSE` metadata and direct listeners need not use
-host port publishing. Stopped containers, missing or ambiguous ports, UDP-only
-declarations, malformed identifiers, and missing addresses fail before a
-management request is sent.
+`run` starts a real child in a dedicated process group, registers its exact
+PID/start identity through the daemon, and conditionally removes the route on
+exit. Nonzero exits and signal exits retain their conventional status. A
+fixed `--app-port` or config `appPort` is checked before exec; otherwise a real
+IPv4 loopback port is reserved and handed off immediately before exec.
 
-Container routes are sent with both the currently resolved address and owner
-metadata:
+`--force` is intentionally narrower for a runner than for a static alias. A
+runner takeover requires matching durable runner state, current daemon route,
+endpoint, UID, PID, start identity, and process group. It terminates that exact
+group and replaces the route with an owner compare-and-set. `alias --force` is
+the explicit administrative unconditional replacement boundary.
 
-```text
-owner.kind      = container
-owner.container = the stable Apple container ID
-owner.network   = the first attached Apple network
-owner.refresh   = container-address
+## Generic routes
+
+Static aliases accept literal loopback or RFC-private unicast addresses. Public,
+unspecified, multicast, and link-local targets are rejected. A host port
+published by any container or VM runtime is therefore just:
+
+```sh
+portless alias api --host 127.0.0.1 --port 8080
+portless alias vm-api --host 192.168.64.8 --port 8080
 ```
 
-The daemon adds an `inspector_uid` from the connection's kernel credentials;
-the client cannot choose it. Container routes must be registered by the
-unprivileged login user that owns the Apple container catalog. The daemon
-re-resolves that UID on every inspection, enters its launchd bootstrap domain,
-drops privileges, and executes the configured absolute CLI with a minimal
-environment. This keeps same-named containers in different login sessions
-unambiguous and never runs a Homebrew-owned executable as root.
+Apple Container discovery is optional. Only the explicit `--container` path
+executes an Apple `container inspect`; its daemon-side reinspection and
+login-UID protections remain intact. The service manifest omits the adapter
+entirely when no absolute executable was configured.
 
-The address is a cached implementation detail, not the identity of the route.
-The daemon must re-inspect the named owner after a container restart and
-atomically replace the upstream when its address changes. Static and
-process-owned routes use `refresh=never`; they must never be reinterpreted as
-container routes.
+## Management protocol v2
 
-The daemon repeats the inspection on add instead of trusting the CLI-provided
-address or network. If the two observations differ, add returns
-`stale_metadata` and the operator retries. Periodic and explicit refreshes use
-the stable container ID and declared port. Failed inspection disables the
-active route without discarding the registration, so a later successful
-inspection restores it without routing to the stale address.
+One bounded newline-delimited JSON request and response use a kernel-authenticated
+Unix connection. Protocol v2 requires every add/remove to declare one match:
 
-Process-owned routes are similarly canonicalized by the daemon. A non-root
-peer may register only a process owned by its kernel UID. The daemon records the
-Darwin process start time and removes the registration when that exact process
-identity disappears.
+- `absent`: safe create;
+- `owner`: replace or remove only the exact daemon-canonical owner;
+- `any`: an explicit administrative force boundary.
 
-## Management protocol
+Process add responses return the daemon-filled start identity. Owner matching
+and registry persistence happen under the same mutation lock, so concurrent
+cleanup cannot remove a newer owner. Unknown protocol versions, operations,
+fields, match modes, owners, extra frames, or mismatched request IDs fail
+closed. Version 1 is not accepted.
 
-The unprivileged CLI sends one newline-delimited JSON request on one connection
-to the permissioned Unix socket and reads one JSON response. Protocol version 1
-supports `add`, `remove`, `list`, `status`, `doctor`, and `refresh`. The reserved
-`install` and `uninstall` operation values are rejected by the daemon with
-`privilege_required`; lifecycle work is never delegated to the management
-group. Each response repeats the valid request ID. Unknown versions,
-operations, owners, refresh policies, fields, oversized frames, extra frames,
-or mismatched request IDs fail closed. The server authenticates kernel peer
-credentials before decoding and applies one total request deadline.
+## Privilege
 
-The default socket is `/var/run/portless/management.sock`. `PORTLESS_SOCKET` may point to
-an alternate absolute socket for development and integration tests.
-`PORTLESS_CONTAINER_CLI` may select an alternate `container` executable for
-controlled integration environments. Neither setting changes daemon listener
-or route policy.
+`init` is invoked as the ordinary user. A healthy same-version daemon and
+doctor result causes an immediate no-sudo return. Otherwise `init` uses only
+fixed `/usr/bin/sudo` to run the root lifecycle command and performs the final
+readiness and doctor calls itself.
 
-Running these commands is the explicit mutation boundary. Merely building or
-testing the repository never installs a service, changes CA trust, or mutates a
-live container.
+Routine route, runner, refresh, prune, and Tailscale operations never invoke
+sudo. `hosts` defaults to a read-only auditable plan; `--apply` requires an
+already-privileged process. Trust install/remove and service uninstall are
+similarly explicit.
 
-## Privileged lifecycle
+## Profiles and sharing
 
-`sudo portless install` and `sudo portless upgrade` are out-of-band bootstrap
-commands that work before the socket exists. They reconcile the binary and
-plist, create and trust the exact local CA, apply the fixed launchctl plan, and
-wait for daemon readiness. `sudo portless uninstall` stops launchd, removes the
-exact trusted CA and installed artifacts, and retains state for recovery. No
-package invokes `sudo`; privilege is supplied explicitly by the operator.
+The default profile remains exact HTTPS `.localhost` on loopback 443 with
+loopback 80 redirects. Foreground daemon/profile flags are `--scheme`,
+`--listen`, `--tld`, `--cert`, `--key`, and `--wildcard`. Custom settings are
+persisted in `profile.json`; a later daemon with no explicit profile loads that
+persisted non-legacy profile, while an explicitly incompatible profile fails.
+The same flags on `init` persist an installed-service profile in its launchd
+manifest. A deliberate replacement carries an auditable reconcile marker and
+is accepted only when `routes.json` is empty, preventing namespace
+reinterpretation. HTTP or certificate-file profiles remove unused generated-CA
+trust and child metadata; generated-CA profiles install them.
+
+Tailscale Serve/Funnel run flags perform live read-only preflight, exact apply,
+verification, and exact cleanup. `--lan` fails closed until Portless can pair
+the existing real `dns-sd` publisher with an eligible LAN listener and a
+certificate valid for the advertised `.local` name.

@@ -60,7 +60,7 @@ listener, releases it immediately before `exec`, and injects:
 | --- | --- |
 | `PORT` | allocated or fixed application port |
 | `HOST` | `127.0.0.1` |
-| `PORTLESS_URL` | `https://<name>.localhost` |
+| `PORTLESS_URL` | active profile origin, including custom scheme/TLD/port |
 
 These keys and `NODE_EXTRA_CA_CERTS` are runner-managed and cannot be supplied
 through the per-run environment map. Because an arbitrary application cannot
@@ -121,9 +121,8 @@ signaling. Missing, static, endpoint-mismatched, stale, or identity-mismatched
 routes cannot authorize a kill. Durable runner state alone is never sufficient,
 so an unrelated process is not killed after PID reuse or state corruption.
 
-Management protocol version 1 still replaces and removes daemon routes by name
-without expected-owner compare-and-set semantics. The runner can therefore
-make process signaling identity-safe, but a future CLI integration that wants
-atomic route takeover or cleanup must first add expected-owner conditional
-mutation to the management protocol. This package does not work around that
-boundary with an unsafe unconditional route mutation.
+Management protocol version 2 provides expected-owner compare-and-set replace
+and remove. The CLI uses the daemon-canonical process owner returned by add,
+so normal cleanup cannot remove a replacement route. Force takeover verifies
+the exact current route through `ForceTakeover`, then atomically replaces only
+that expected owner.
