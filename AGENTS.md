@@ -2,9 +2,12 @@
 
 ## Product boundary
 
-Build a small, production-friendly Go port of the useful Portless behavior for
-macOS and Apple containers. The user-facing contract is stable HTTPS names such
-as `https://fieldnotes.localhost`; internal ports and container addresses remain
+Build a small, production-friendly Go port of Portless. The routing core is
+runtime-agnostic: local processes and containers from Docker, Podman, Apple
+Container, Lima, or any other runtime are ordinary validated host/port
+upstreams. Runtime discovery adapters are optional conveniences, never core
+requirements. The user-facing contract is stable HTTPS names such as
+`https://fieldnotes.localhost`; internal ports and container addresses remain
 implementation details.
 
 ## Engineering constraints
