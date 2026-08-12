@@ -294,7 +294,7 @@ func (s *Service) bind(address netip.Addr, preferredPort uint16) (*active, error
 		listener.Close()
 		return nil, err
 	}
-	handler := http.Handler(proxyHandler)
+	var handler http.Handler
 	authorized := func(request *http.Request) bool {
 		return s.request.Authorize == nil || s.request.Authorize(request.Context())
 	}

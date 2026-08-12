@@ -28,7 +28,8 @@ import (
 	"github.com/euforicio/portless/internal/service"
 )
 
-const version = "0.0.0-dev"
+var version = "0.0.0-dev"
+
 const publicCACertificatePath = "/usr/local/share/portless/ca.pem"
 
 func main() {

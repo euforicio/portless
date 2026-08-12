@@ -129,7 +129,7 @@ func (r Resolver) Resolve(ctx context.Context, name string, requestedPort uint16
 	command.Stderr = io.Discard
 	if err := command.Run(); err != nil {
 		if errors.Is(inspectCtx.Err(), context.DeadlineExceeded) {
-			return Endpoint{}, errors.New("Apple container inspection timed out")
+			return Endpoint{}, errors.New("apple container inspection timed out")
 		}
 		var exitError *exec.ExitError
 		if errors.As(err, &exitError) {
@@ -138,7 +138,7 @@ func (r Resolver) Resolve(ctx context.Context, name string, requestedPort uint16
 		return Endpoint{}, fmt.Errorf("inspect Apple container %q: %w", name, err)
 	}
 	if stdout.exceeded {
-		return Endpoint{}, errors.New("Apple container inspection exceeded the size limit")
+		return Endpoint{}, errors.New("apple container inspection exceeded the size limit")
 	}
 
 	var records []inspectRecord
@@ -154,7 +154,7 @@ func (r Resolver) Resolve(ctx context.Context, name string, requestedPort uint16
 		return Endpoint{}, fmt.Errorf("%w: %q", ErrNotFound, name)
 	}
 	if len(records) != 1 || records[0].ID != name || records[0].Configuration.ID != name {
-		return Endpoint{}, errors.New("Apple container inspection returned an unexpected container")
+		return Endpoint{}, errors.New("apple container inspection returned an unexpected container")
 	}
 	record := records[0]
 	if record.Status.State != "running" {
@@ -182,13 +182,13 @@ func (r Resolver) Resolve(ctx context.Context, name string, requestedPort uint16
 
 func (c Credential) validate() error {
 	if c.UID == 0 {
-		return errors.New("Apple container inspection requires an unprivileged user")
+		return errors.New("apple container inspection requires an unprivileged user")
 	}
 	if c.Username == "" || strings.ContainsAny(c.Username, "=\x00\r\n") {
-		return errors.New("Apple container inspection user is invalid")
+		return errors.New("apple container inspection user is invalid")
 	}
 	if !filepath.IsAbs(c.HomeDir) || strings.ContainsAny(c.HomeDir, "\x00\r\n") {
-		return errors.New("Apple container inspection home directory is invalid")
+		return errors.New("apple container inspection home directory is invalid")
 	}
 	return nil
 }

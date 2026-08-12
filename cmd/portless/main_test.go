@@ -312,11 +312,18 @@ func TestGenericRunLANEndToEndAndSignalCleanup(t *testing.T) {
 		cancel()
 		t.Fatalf("clean code = %d, stdout=%s stderr=%s", code, cleanOutput.String(), stderr.String())
 	}
-	time.Sleep(2500 * time.Millisecond)
-	exposures, err := ownedLANExposures()
-	if err != nil || len(exposures) != 0 {
-		cancel()
-		t.Fatalf("LAN state after clean = %#v, %v", exposures, err)
+	deadline = time.Now().Add(5 * time.Second)
+	var exposures []ownedLAN
+	for {
+		exposures, err = ownedLANExposures()
+		if err == nil && len(exposures) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("LAN state after clean = %#v, %v", exposures, err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if response, requestErr := httpClient.Get(lanURL); requestErr == nil {
 		response.Body.Close()
@@ -336,6 +343,39 @@ func TestGenericRunLANEndToEndAndSignalCleanup(t *testing.T) {
 	listed, err := (client.Client{SocketPath: socketPath}).Call(t.Context(), client.Request{Operation: client.OperationList})
 	if err != nil || len(listed.Routes) != 0 {
 		t.Fatalf("routes after signal = %#v, %v", listed.Routes, err)
+	}
+}
+
+func TestGenericRunCleansLANWhenTailscaleSetupFails(t *testing.T) {
+	addresses, err := mdns.EligibleAddresses()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) == 0 {
+		t.Skip("no eligible assigned LAN address")
+	}
+	socketPath := startRuntime(t, "")
+	t.Setenv("PORTLESS_SOCKET", socketPath)
+	t.Setenv("PORTLESS_RUNNER_STATE", filepath.Join(t.TempDir(), "runner"))
+	t.Setenv("GO_WANT_PORTLESS_LAN_SERVER", "1")
+	t.Setenv("PATH", t.TempDir())
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run(t.Context(), []string{
+		"run", "--name", "lan-share-failure", "--lan", "--tailscale", "--ip", addresses[0].Address.String(), "--",
+		os.Args[0], "-test.run=TestPortlessLANServerHelper",
+	}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "configure Tailscale") {
+		t.Fatalf("run code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	exposures, err := ownedLANExposures()
+	if err != nil || len(exposures) != 0 {
+		t.Fatalf("LAN state after Tailscale failure = %#v, %v", exposures, err)
+	}
+	listed, err := (client.Client{SocketPath: socketPath}).Call(t.Context(), client.Request{Operation: client.OperationList})
+	if err != nil || len(listed.Routes) != 0 {
+		t.Fatalf("routes after Tailscale failure = %#v, %v", listed.Routes, err)
 	}
 }
 

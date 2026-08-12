@@ -27,11 +27,11 @@ const (
 )
 
 var (
-	ErrUnavailable      = errors.New("Tailscale is unavailable")
-	ErrHTTPSUnavailable = errors.New("Tailscale HTTPS is unavailable")
+	ErrUnavailable      = errors.New("tailscale is unavailable")
+	ErrHTTPSUnavailable = errors.New("tailscale HTTPS is unavailable")
 	ErrNoPort           = errors.New("no supported HTTPS port is available")
-	ErrConflict         = errors.New("Tailscale registration conflicts with current state")
-	errOutputLimit      = errors.New("Tailscale command output limit reached")
+	ErrConflict         = errors.New("tailscale registration conflicts with current state")
+	errOutputLimit      = errors.New("tailscale command output limit reached")
 )
 
 // Mode controls the exposure boundary.
@@ -374,15 +374,15 @@ func normalizeTarget(raw string) (string, error) {
 	target, err := url.Parse(raw)
 	if err != nil || target.Scheme != "http" || target.User != nil || target.Opaque != "" ||
 		target.Path != "" || target.RawQuery != "" || target.Fragment != "" {
-		return "", errors.New("Tailscale target must be an HTTP loopback URL without a path")
+		return "", errors.New("tailscale target must be an HTTP loopback URL without a path")
 	}
 	address, err := netip.ParseAddr(target.Hostname())
 	if err != nil || !address.IsLoopback() || address.Unmap() != netip.MustParseAddr("127.0.0.1") {
-		return "", errors.New("Tailscale target must use 127.0.0.1")
+		return "", errors.New("tailscale target must use 127.0.0.1")
 	}
 	port, err := strconv.ParseUint(target.Port(), 10, 16)
 	if err != nil || port == 0 {
-		return "", errors.New("Tailscale target requires a valid port")
+		return "", errors.New("tailscale target requires a valid port")
 	}
 	return "http://127.0.0.1:" + strconv.FormatUint(port, 10), nil
 }
@@ -429,11 +429,11 @@ func (c Client) run(ctx context.Context, executable string, arguments ...string)
 	if output.exceeded {
 		_ = command.Process.Kill()
 		_ = command.Wait()
-		return nil, errors.New("Tailscale command output exceeded the size limit")
+		return nil, errors.New("tailscale command output exceeded the size limit")
 	}
 	err = command.Wait()
 	if errors.Is(commandContext.Err(), context.DeadlineExceeded) {
-		return nil, errors.New("Tailscale command timed out")
+		return nil, errors.New("tailscale command timed out")
 	}
 	if copyErr != nil {
 		return nil, fmt.Errorf("read Tailscale command output: %w", copyErr)

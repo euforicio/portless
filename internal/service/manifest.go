@@ -236,14 +236,14 @@ func isLoopbackListener(address string, wantedPort uint64) bool {
 
 func writeKey(out *bytes.Buffer, key string) {
 	out.WriteString("  <key>")
-	xml.EscapeText(out, []byte(key))
+	_ = xml.EscapeText(out, []byte(key)) // bytes.Buffer writes cannot fail.
 	out.WriteString("</key>\n")
 }
 
 func writeString(out *bytes.Buffer, key, value string) {
 	writeKey(out, key)
 	out.WriteString("  <string>")
-	xml.EscapeText(out, []byte(value))
+	_ = xml.EscapeText(out, []byte(value)) // bytes.Buffer writes cannot fail.
 	out.WriteString("</string>\n")
 }
 
@@ -266,7 +266,7 @@ func writeArray(out *bytes.Buffer, key string, values []string) {
 	out.WriteString("  <array>\n")
 	for _, value := range values {
 		out.WriteString("    <string>")
-		xml.EscapeText(out, []byte(value))
+		_ = xml.EscapeText(out, []byte(value)) // bytes.Buffer writes cannot fail.
 		out.WriteString("</string>\n")
 	}
 	out.WriteString("  </array>\n")

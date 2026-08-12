@@ -1,0 +1,35 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+  exclusions:
+    rules:
+      # Cleanup failures cannot affect the already-selected primary error. Keep
+      # this exception limited to explicit cleanup calls in lifecycle and
+      # persistence code.
+      - path: '(^|/)(cmd/portless/(lan_state|share_state|main)|internal/(client/client|daemon/(management|profile_state|state)|hosts/hosts|lan/lan|pki/authority|projectconfig/config|runner/(runner|state)|service/(installer|socket)))\.go$'
+        text: 'Error return value of `(os\.Remove|unix\.Close|unix\.Flock|.*\.Close|.*\.Flush)` is not checked'
+        linters:
+          - errcheck
+      # CLI output errors cannot be surfaced without replacing the command's
+      # real result; this does not exempt file, socket, or protocol writes.
+      - path: '(^|/)cmd/portless/.*\.go$'
+        text: 'Error return value of `fmt\.Fprint(f|ln)?` is not checked'
+        linters:
+          - errcheck
+      # Tests intentionally discard cleanup and diagnostic-output failures;
+      # production I/O remains fully checked.
+      - path: '_test\.go$'
+        text: 'Error return value of `(.*\.Close|fmt\.Fprint(f|ln)?|io\.WriteString|os\.Remove(All)?)` is not checked'
+        linters:
+          - errcheck
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

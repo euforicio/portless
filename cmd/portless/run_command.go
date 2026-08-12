@@ -251,10 +251,14 @@ func runProject(ctx context.Context, management client.Client, args []string, st
 				}
 			}
 			if shareErr != nil {
+				lanCleanupErr := cleanupLAN(process.Identity(), lanService)
 				_ = cleanupRoute(context.WithoutCancel(ctx), management, registered)
 				_ = process.Signal(syscall.SIGTERM)
 				_, _ = process.Wait()
-				return fmt.Errorf("configure Tailscale %s: %w", mode, shareErr)
+				return errors.Join(
+					fmt.Errorf("configure Tailscale %s: %w", mode, shareErr),
+					lanCleanupErr,
+				)
 			}
 			sharingPlan = &plan
 			sharedAuthority := plan.Registration.Host
@@ -267,11 +271,8 @@ func runProject(ctx context.Context, management client.Client, args []string, st
 
 	result, waitErr := process.Wait()
 	if lanService != nil {
-		registration := lanService.Registration()
-		if lanErr := lanService.Close(); lanErr != nil {
+		if lanErr := cleanupLAN(process.Identity(), lanService); lanErr != nil {
 			fmt.Fprintf(stderr, "portless: LAN cleanup deferred: %v\n", lanErr)
-		} else if stateErr := removeOwnedLAN(process.Identity(), registration.Name); stateErr != nil {
-			fmt.Fprintf(stderr, "portless: LAN state cleanup deferred: %v\n", stateErr)
 		}
 	}
 	if sharingPlan != nil {
@@ -295,6 +296,17 @@ func runProject(ctx context.Context, management client.Client, args []string, st
 		return commandExitError{code: result.ExitCode}
 	}
 	return waitErr
+}
+
+func cleanupLAN(identity runner.Identity, service *lan.Service) error {
+	if service == nil {
+		return nil
+	}
+	registration := service.Registration()
+	if err := service.Close(); err != nil {
+		return err
+	}
+	return removeOwnedLAN(identity, registration.Name)
 }
 
 func parseRunOptions(args []string, stderr io.Writer, shorthand bool) (runOptions, error) {

@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"io"
 	"net"
@@ -499,17 +498,4 @@ func equalStrings(left, right []string) bool {
 		}
 	}
 	return true
-}
-
-func parsePEMCertificate(t *testing.T, data []byte) *x509.Certificate {
-	t.Helper()
-	block, _ := pem.Decode(data)
-	if block == nil {
-		t.Fatal("no PEM certificate")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cert
 }

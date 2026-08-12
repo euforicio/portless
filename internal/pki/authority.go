@@ -422,7 +422,8 @@ func normalizeHost(host, suffix string) (string, error) {
 			return "", fmt.Errorf("invalid DNS label in %q", host)
 		}
 		for _, ch := range label {
-			if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-') {
+			valid := (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-'
+			if !valid {
 				return "", fmt.Errorf("invalid DNS label in %q", host)
 			}
 		}

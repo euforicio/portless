@@ -183,7 +183,8 @@ func Start(parent context.Context, config Config) (*Runtime, error) {
 			allowedSuffix = config.Profile.TLD
 		}
 		runtime.authority, err = pki.Open(filepath.Join(config.StateDir, "pki"), pki.Options{
-			AllowedSuffix: allowedSuffix,
+			AllowedSuffix:       allowedSuffix,
+			MaxLeafCertificates: maxRegistrations,
 			AllowHost: func(host string) bool {
 				_, found := runtime.table.Resolve(host)
 				return found
@@ -513,7 +514,7 @@ func (r *Runtime) Refresh(ctx context.Context) ([]client.Diagnostic, error) {
 
 func (r *Runtime) containerResolver(uid uint32) (applecontainer.Resolver, error) {
 	if r.config.ContainerCLI == "" {
-		return applecontainer.Resolver{}, errors.New("Apple container adapter is not configured")
+		return applecontainer.Resolver{}, errors.New("apple container adapter is not configured")
 	}
 	if uid == 0 {
 		return applecontainer.Resolver{}, errors.New("container registration has no unprivileged inspector")
@@ -569,7 +570,7 @@ func normalizeConfig(config Config) (Config, error) {
 		}
 	}
 	if config.ContainerCLI != "" && !filepath.IsAbs(config.ContainerCLI) {
-		return Config{}, errors.New("Apple container executable must be absolute")
+		return Config{}, errors.New("apple container executable must be absolute")
 	}
 	if config.RefreshInterval == 0 {
 		config.RefreshInterval = defaultRefreshInterval
