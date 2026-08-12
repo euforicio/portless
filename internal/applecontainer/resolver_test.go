@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"os/user"
@@ -171,6 +172,19 @@ func TestRealAppleContainerInspect(t *testing.T) {
 	}
 	if endpoint.Container != containerID || !endpoint.Address.IsValid() {
 		t.Fatalf("unexpected endpoint: %#v", endpoint)
+	}
+	address := net.JoinHostPort(endpoint.Address.String(), strconv.Itoa(int(endpoint.Port)))
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		connection, dialErr := (&net.Dialer{Timeout: time.Second}).DialContext(t.Context(), "tcp", address)
+		if dialErr == nil {
+			_ = connection.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial resolved endpoint %s: %v", address, dialErr)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

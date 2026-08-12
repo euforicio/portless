@@ -1,0 +1,42 @@
+name: Apple Container integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Run on a provisioned Apple silicon runner with Apple Container installed
+        required: true
+        type: boolean
+        default: false
+      image:
+        description: OCI image with an HTTP listener on port 80
+        required: true
+        type: string
+        default: docker.io/library/nginx:alpine
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-container-integration-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    if: inputs.confirm == true
+    name: Real Apple Container resolver
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Exercise the real Apple Container resolver
+        env:
+          PORTLESS_TEST_CONTAINER_IMAGE: ${{ inputs.image }}
+          PORTLESS_TEST_CONTAINER_PORT: '80'
+        run: ./scripts/test-apple-container-integration
