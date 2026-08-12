@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+container_cli="${PORTLESS_CONTAINER_CLI:-container}"
+container_image="${PORTLESS_TEST_CONTAINER_IMAGE:-docker.io/library/nginx:alpine}"
+container_port="${PORTLESS_TEST_CONTAINER_PORT:-80}"
+container_id="portless-it-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+owns_container=0
+
+cleanup() {
+  status=$?
+  trap - EXIT
+  set +e
+
+  if [[ "$owns_container" -eq 1 ]]; then
+    "$container_cli" delete --force "$container_id" >/dev/null 2>&1 || true
+    if ! remaining_containers="$($container_cli list --all --quiet)"; then
+      echo "failed to verify cleanup of owned Apple container $container_id" >&2
+      status=1
+    elif grep -Fxq "$container_id" <<<"$remaining_containers"; then
+      echo "owned Apple container still exists after deletion: $container_id" >&2
+      status=1
+    fi
+  fi
+
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+  echo "Apple Container integration requires Apple silicon macOS" >&2
+  exit 1
+fi
+macos_major="$(sw_vers -productVersion | cut -d. -f1)"
+if ! [[ "$macos_major" =~ ^[0-9]+$ ]] || ((macos_major < 26)); then
+  echo "Apple Container integration requires macOS 26 or newer" >&2
+  exit 1
+fi
+if ! command -v "$container_cli" >/dev/null 2>&1; then
+  echo "Apple container CLI is unavailable: $container_cli" >&2
+  exit 1
+fi
+if ! [[ "$container_port" =~ ^[0-9]+$ ]] || ((10#$container_port < 1 || 10#$container_port > 65535)); then
+  echo "PORTLESS_TEST_CONTAINER_PORT must be between 1 and 65535" >&2
+  exit 1
+fi
+
+system_status="$($container_cli system status 2>/dev/null || true)"
+if ! grep -Eq '^status[[:space:]]+running$' <<<"$system_status"; then
+  "$container_cli" system start
+fi
+"$container_cli" system status
+"$container_cli" system version
+
+if "$container_cli" list --all --quiet | grep -Fxq "$container_id"; then
+  echo "refusing to reuse existing Apple container $container_id" >&2
+  exit 1
+fi
+
+# The UUID name did not exist when selected. From this point onward the exact
+# name is owned by this process and is the only container cleanup may remove.
+owns_container=1
+"$container_cli" run \
+  --name "$container_id" \
+  --detach \
+  --label dev.portless.integration=true \
+  "$container_image"
+
+export PORTLESS_TEST_CONTAINER="$container_id"
+export PORTLESS_TEST_CONTAINER_PORT="$container_port"
+printf 'PORTLESS_TEST_CONTAINER=%s\n' "$PORTLESS_TEST_CONTAINER"
+printf 'PORTLESS_TEST_CONTAINER_PORT=%s\n' "$PORTLESS_TEST_CONTAINER_PORT"
+
+go test ./internal/applecontainer -run '^TestRealAppleContainerInspect$' -count=1 -v

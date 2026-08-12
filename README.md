@@ -137,3 +137,21 @@ allowed only after every route has been removed.
 See [CLI](docs/cli.md), [architecture](docs/architecture.md),
 [profiles](docs/proxy-profiles.md), [runner](docs/runner.md),
 [sharing](docs/sharing.md), and [PKI/service](docs/pki-service.md).
+
+## Apple Container integration
+
+The optional real-runtime integration requires Apple silicon macOS with the
+Apple `container` CLI installed. It creates a uniquely named nginx container,
+exports `PORTLESS_TEST_CONTAINER` and `PORTLESS_TEST_CONTAINER_PORT` for the
+real resolver test, verifies the resolved TCP endpoint, and deletes only that
+exact container on success, failure, or interruption:
+
+```sh
+./scripts/test-apple-container-integration
+```
+
+GitHub Actions exposes the same path only through the manually dispatched
+`Apple Container integration` workflow. The job requires explicit confirmation
+and a provisioned self-hosted runner carrying the standard `macOS` and `ARM64`
+labels, so ordinary pull-request and push CI never attempts unsupported nested
+virtualization on hosted runners.
