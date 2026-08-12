@@ -135,5 +135,6 @@ allowed only after every route has been removed.
   or DNS configuration, `/etc/hosts`, or unrelated `dns-sd` processes.
 
 See [CLI](docs/cli.md), [architecture](docs/architecture.md),
+[performance benchmarks](docs/benchmarks.md),
 [profiles](docs/proxy-profiles.md), [runner](docs/runner.md),
 [sharing](docs/sharing.md), and [PKI/service](docs/pki-service.md).
