@@ -132,7 +132,19 @@ unknown fields and trailing frames, and applies a total read/operation/write
 deadline. Shutdown closes accepted management connections before waiting for
 handler goroutines.
 
-Automated tests use temporary files, real P-256 certificates and TLS
-handshakes, real child executables and Unix sockets, read-only system-keychain
-inspection, and native `plutil` validation. They do not load a system daemon or
-change a live trust store.
+Ordinary automated tests use temporary files, real P-256 certificates and TLS
+handshakes, real child executables and Unix sockets, native `plutil`, read-only
+`launchctl` and system-keychain inspection, and read-only live `/etc/hosts`
+plans. They do not load a system daemon, bind privileged ports, change a live
+trust store, or write `/etc/hosts`.
+
+The manual `Privileged macOS integration` workflow covers the provisioned
+lifecycle that is unsafe on developer machines and ordinary CI. It requires the
+protected `privileged-macos-integration` environment plus the exact dispatch
+confirmation `RUN-PRIVILEGED-PORTLESS`, runs only on a fresh GitHub-hosted
+macOS runner, rejects pre-existing Portless artifacts, and exercises real
+`init`, idempotent install/upgrade, launchd, system CA trust, HTTPS routing on
+ports 80/443, and uninstall. Its cleanup trap removes only the fixed Portless
+service and retained state paths. Final assertions verify that the job,
+artifacts, socket, public CA, and exact trusted certificate are absent after
+first observing uninstall's retained-state contract.
