@@ -66,6 +66,17 @@ func TestPortlessLANCrashSupervisorHelper(t *testing.T) {
 	os.Exit(code)
 }
 
+func TestPortlessTakeoverSupervisorHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_PORTLESS_TAKEOVER_SUPERVISOR") != "1" {
+		return
+	}
+	code := run(context.Background(), []string{
+		"run", "--name", "stale", "--",
+		os.Args[0], "-test.run=^TestPortlessLANServerHelper$",
+	}, io.Discard, io.Discard)
+	os.Exit(code)
+}
+
 func TestCommandSurfaceUsesRealManagementSocket(t *testing.T) {
 	socketPath := startRuntime(t, "/usr/bin/false")
 	t.Setenv("PORTLESS_SOCKET", socketPath)
@@ -238,6 +249,230 @@ func TestGenericRunRegistersCleansAndPreservesExitStatus(t *testing.T) {
 	if len(response.Routes) != 0 {
 		t.Fatalf("route cleanup left %#v", response.Routes)
 	}
+}
+
+func TestGenericRunForceTakesOverExactOwnerAndCleans(t *testing.T) {
+	socketPath := startRuntime(t, "")
+	runnerDirectory := filepath.Join(t.TempDir(), "runner")
+	t.Setenv("PORTLESS_SOCKET", socketPath)
+	t.Setenv("PORTLESS_RUNNER_STATE", runnerDirectory)
+	t.Setenv("GO_WANT_PORTLESS_LAN_SERVER", "1")
+
+	manager, err := runner.Open(runnerDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := startTakeoverProcess(t, manager, "takeover.localhost")
+	management := client.Client{SocketPath: socketPath}
+	previousRoute := registerTakeoverRoute(t, management, previous)
+
+	previousWait := make(chan struct{})
+	go func() {
+		_, _ = previous.Wait()
+		close(previousWait)
+	}()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan int, 1)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	go func() {
+		done <- run(ctx, []string{
+			"run", "--name", "takeover", "--force", "--",
+			os.Args[0], "-test.run=^TestPortlessLANServerHelper$",
+		}, &stdout, &stderr)
+	}()
+
+	current := waitForDifferentRouteOwner(t, management, previousRoute)
+	select {
+	case <-previousWait:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("taken-over process was not reaped")
+	}
+	previousAddress := net.JoinHostPort(previousRoute.Host, strconv.Itoa(int(previousRoute.Port)))
+	if connection, err := net.DialTimeout("tcp", previousAddress, 200*time.Millisecond); err == nil {
+		connection.Close()
+		cancel()
+		t.Fatalf("taken-over listener %s remained reachable", previousAddress)
+	}
+	currentAddress := "http://" + net.JoinHostPort(current.Host, strconv.Itoa(int(current.Port)))
+	if err := waitForHTTPBody(currentAddress, "lan-cli-ok", 3*time.Second); err != nil {
+		cancel()
+		t.Fatalf("replacement endpoint: %v", err)
+	}
+
+	staleOwner := previousRoute.Owner
+	staleReplacement := current
+	staleReplacement.Port++
+	staleReplacement.Owner = client.Owner{Kind: client.OwnerStatic, Refresh: client.RefreshNever}
+	if _, err := management.Call(t.Context(), client.Request{
+		Operation: client.OperationAdd, Route: &staleReplacement,
+		Match: client.RouteMatchOwner, ExpectedOwner: &staleOwner,
+	}); err == nil || !isRouteConflict(err) {
+		cancel()
+		t.Fatalf("stale owner compare-and-set error = %v", err)
+	}
+	if got := waitForRoute(t, management, current.Name); got != current {
+		cancel()
+		t.Fatalf("failed compare-and-set changed route: got %#v, want %#v", got, current)
+	}
+
+	cancel()
+	if code := <-done; code != 143 {
+		t.Fatalf("forced run exit = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	listed, err := management.Call(t.Context(), client.Request{Operation: client.OperationList})
+	if err != nil || len(listed.Routes) != 0 {
+		t.Fatalf("routes after replacement cleanup = %#v, %v", listed.Routes, err)
+	}
+	records, err := manager.Records()
+	if err != nil || len(records) != 0 {
+		t.Fatalf("runner state after replacement cleanup = %#v, %v", records, err)
+	}
+}
+
+func TestForceRunnerTakeoverFailureAndProcessSafety(t *testing.T) {
+	t.Run("missing route", func(t *testing.T) {
+		management := client.Client{SocketPath: startRuntime(t, "")}
+		manager, err := runner.Open(filepath.Join(t.TempDir(), "runner"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := forceRunnerTakeover(t.Context(), management, manager, "missing.localhost"); err == nil || !strings.Contains(err.Error(), "route is not registered") {
+			t.Fatalf("missing route error = %v", err)
+		}
+	})
+
+	t.Run("untracked unrelated process", func(t *testing.T) {
+		management := client.Client{SocketPath: startRuntime(t, "")}
+		manager, err := runner.Open(filepath.Join(t.TempDir(), "runner"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		unrelated := exec.Command("/bin/sleep", "30")
+		if err := unrelated.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = unrelated.Process.Kill()
+			_ = unrelated.Wait()
+		})
+		route := client.Route{
+			Name: "unrelated.localhost", Scheme: "http", Host: "127.0.0.1", Port: 43210,
+			Owner: client.Owner{Kind: client.OwnerProcess, PID: unrelated.Process.Pid, Refresh: client.RefreshNever},
+		}
+		if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &route, Match: client.RouteMatchAbsent}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := forceRunnerTakeover(t.Context(), management, manager, route.Name); !errors.Is(err, runner.ErrNotTracked) {
+			t.Fatalf("untracked takeover error = %v", err)
+		}
+		if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+			t.Fatalf("untracked process was affected: %v", err)
+		}
+	})
+
+	t.Run("current owner mismatch", func(t *testing.T) {
+		management := client.Client{SocketPath: startRuntime(t, "")}
+		manager, err := runner.Open(filepath.Join(t.TempDir(), "runner"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tracked := startTakeoverProcess(t, manager, "mismatch.localhost")
+		route := client.Route{
+			Name: tracked.Endpoint().Name, Scheme: "http", Host: tracked.Endpoint().Host, Port: tracked.Endpoint().Port,
+			Owner: client.Owner{Kind: client.OwnerProcess, PID: os.Getpid(), Refresh: client.RefreshNever},
+		}
+		if _, err := management.Call(t.Context(), client.Request{Operation: client.OperationAdd, Route: &route, Match: client.RouteMatchAbsent}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := forceRunnerTakeover(t.Context(), management, manager, route.Name); !errors.Is(err, runner.ErrIdentityMismatch) {
+			t.Fatalf("identity mismatch error = %v", err)
+		}
+		if err := tracked.Signal(syscall.Signal(0)); err != nil {
+			t.Fatalf("tracked process was affected: %v", err)
+		}
+	})
+
+	t.Run("stale tracked process", func(t *testing.T) {
+		socketPath := startRuntime(t, "")
+		runnerDirectory := filepath.Join(t.TempDir(), "runner")
+		t.Setenv("PORTLESS_SOCKET", socketPath)
+		t.Setenv("PORTLESS_RUNNER_STATE", runnerDirectory)
+		management := client.Client{SocketPath: socketPath}
+		manager, err := runner.Open(runnerDirectory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		supervisor := exec.Command(os.Args[0], "-test.run=^TestPortlessTakeoverSupervisorHelper$")
+		supervisor.Env = append(os.Environ(),
+			"GO_WANT_PORTLESS_TAKEOVER_SUPERVISOR=1",
+			"GO_WANT_PORTLESS_LAN_SERVER=1",
+			"PORTLESS_SOCKET="+socketPath,
+			"PORTLESS_RUNNER_STATE="+runnerDirectory,
+		)
+		if err := supervisor.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if supervisor.ProcessState == nil {
+				_ = supervisor.Process.Kill()
+				_ = supervisor.Wait()
+			}
+		})
+		route := waitForRoute(t, management, "stale.localhost")
+		var record runner.Record
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			discovered, discoverErr := manager.Discover()
+			if discoverErr == nil && len(discovered) == 1 {
+				record = discovered[0].Record
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if record.Identity.PID == 0 {
+			t.Fatal("stale fixture was not recorded")
+		}
+		if err := supervisor.Process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+		_ = supervisor.Wait()
+		if err := syscall.Kill(-record.ProcessGroup, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			t.Fatal(err)
+		}
+		deadline = time.Now().Add(5 * time.Second)
+		staleObserved := false
+		for time.Now().Before(deadline) {
+			discovered, _ := manager.Discover()
+			if len(discovered) == 1 && discovered[0].Status == runner.StatusStale {
+				staleObserved = true
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if !staleObserved {
+			t.Fatal("runner state did not become stale")
+		}
+		if got, err := forceRunnerTakeover(t.Context(), management, manager, route.Name); err != nil || got != route {
+			t.Fatalf("stale takeover = %#v, %v", got, err)
+		}
+		records, err := manager.Records()
+		if err != nil || len(records) != 0 {
+			t.Fatalf("state after stale takeover = %#v, %v", records, err)
+		}
+	})
+
+	t.Run("management socket unavailable", func(t *testing.T) {
+		manager, err := runner.Open(filepath.Join(t.TempDir(), "runner"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		management := client.Client{SocketPath: filepath.Join(t.TempDir(), "missing.sock")}
+		if _, err := forceRunnerTakeover(t.Context(), management, manager, "unavailable.localhost"); err == nil || !strings.Contains(err.Error(), "force requires an existing runner-owned route") {
+			t.Fatalf("management failure = %v", err)
+		}
+	})
 }
 
 func TestGenericRunLANEndToEndAndSignalCleanup(t *testing.T) {
@@ -510,6 +745,113 @@ func TestLANFlagsRequireExplicitOptIn(t *testing.T) {
 	if err != nil || !options.lan || !options.https || options.ip != "192.168.1.2" {
 		t.Fatalf("explicit LAN options = %#v, %v", options, err)
 	}
+}
+
+func startTakeoverProcess(t *testing.T, manager *runner.Manager, name string) *runner.Process {
+	t.Helper()
+	process, err := manager.Start(context.Background(), runner.Spec{
+		Name: name, Proxy: true,
+		Command:     []string{os.Args[0], "-test.run=^TestPortlessLANServerHelper$"},
+		Environment: map[string]string{"GO_WANT_PORTLESS_LAN_SERVER": "1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = process.Signal(syscall.SIGKILL)
+		_, _ = process.Wait()
+	})
+	endpoint := process.Endpoint()
+	address := "http://" + net.JoinHostPort(endpoint.Host, strconv.Itoa(int(endpoint.Port)))
+	if err := waitForHTTPBody(address, "lan-cli-ok", 3*time.Second); err != nil {
+		t.Fatalf("takeover process listener did not become ready: %v", err)
+	}
+	return process
+}
+
+func waitForHTTPBody(address, want string, timeout time.Duration) error {
+	client := &http.Client{
+		Timeout:   500 * time.Millisecond,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	defer client.CloseIdleConnections()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		response, err := client.Get(address)
+		if err == nil {
+			body, readErr := io.ReadAll(response.Body)
+			response.Body.Close()
+			if readErr == nil && string(body) == want {
+				return nil
+			}
+			lastErr = fmt.Errorf("body = %q, read error = %v", body, readErr)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return lastErr
+}
+
+func registerTakeoverRoute(t *testing.T, management client.Client, process *runner.Process) client.Route {
+	t.Helper()
+	endpoint := process.Endpoint()
+	route := client.Route{
+		Name: endpoint.Name, Scheme: "http", Host: endpoint.Host, Port: endpoint.Port,
+		Owner: client.Owner{Kind: client.OwnerProcess, PID: process.PID(), Refresh: client.RefreshNever},
+	}
+	response, err := management.Call(t.Context(), client.Request{
+		Operation: client.OperationAdd, Route: &route, Match: client.RouteMatchAbsent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Route == nil || response.Route.Owner.ProcessStart != process.Identity().Start {
+		t.Fatalf("canonical runner route = %#v", response.Route)
+	}
+	return *response.Route
+}
+
+func waitForDifferentRouteOwner(t *testing.T, management client.Client, previous client.Route) client.Route {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		response, err := management.Call(t.Context(), client.Request{Operation: client.OperationList})
+		if err == nil {
+			for _, route := range response.Routes {
+				if route.Name == previous.Name && route.Owner != previous.Owner {
+					return route
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("replacement route did not become active")
+	return client.Route{}
+}
+
+func waitForRoute(t *testing.T, management client.Client, name string) client.Route {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		response, err := management.Call(t.Context(), client.Request{Operation: client.OperationList})
+		if err == nil {
+			for _, route := range response.Routes {
+				if route.Name == name {
+					return route
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("route %s was not found", name)
+	return client.Route{}
+}
+
+func isRouteConflict(err error) bool {
+	var responseErr *client.ResponseError
+	return errors.As(err, &responseErr) && responseErr.Code == "route_conflict"
 }
 
 func startRuntime(t *testing.T, containerCLI string) string {

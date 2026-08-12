@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -161,27 +165,148 @@ func TestReadOnlyRunnerBoundsRealChildProcess(t *testing.T) {
 	}
 }
 
-func TestRealServeApplyAndExactCleanupOptIn(t *testing.T) {
-	if os.Getenv("PORTLESS_TEST_TAILSCALE_MUTATION") != "1" {
-		t.Skip("set PORTLESS_TEST_TAILSCALE_MUTATION=1 for real Serve mutation")
+func TestRealServeAndFunnelMutationPreserveUnrelatedConfigurationOptIn(t *testing.T) {
+	gate := os.Getenv("PORTLESS_TEST_TAILSCALE_MUTATION")
+	if gate == "" {
+		t.Skip("set PORTLESS_TEST_TAILSCALE_MUTATION=serve, funnel, or all on a dedicated runner")
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		response.WriteHeader(http.StatusNoContent)
+	if gate != "serve" && gate != "funnel" && gate != "all" {
+		t.Fatalf("PORTLESS_TEST_TAILSCALE_MUTATION must be serve, funnel, or all; got %q", gate)
+	}
+	modes := []Mode{Serve, Funnel}
+	for _, mode := range modes {
+		if gate != "all" && gate != string(mode) {
+			continue
+		}
+		t.Run(string(mode), func(t *testing.T) {
+			testRealTailscaleMutation(t, mode)
+		})
+	}
+}
+
+func testRealTailscaleMutation(t *testing.T, mode Mode) {
+	t.Helper()
+	token := "portless-" + string(mode) + "-mutation-ok"
+	subjectServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write([]byte(token))
 	}))
-	defer server.Close()
-	client := Client{Timeout: 15 * time.Second}
-	plan, err := client.BuildPlan(t.Context(), Request{Name: "integration", Mode: Serve, Target: server.URL})
+	defer subjectServer.Close()
+	sentinelServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write([]byte("unrelated-" + string(mode)))
+	}))
+	defer sentinelServer.Close()
+	client := Client{Timeout: 20 * time.Second}
+	executable, err := client.executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Apply(t.Context(), plan); err != nil {
-		t.Fatal(err)
+	before := readRealServeConfiguration(t, client, executable)
+	sentinel, err := client.BuildPlan(t.Context(), Request{Name: "unrelated-" + string(mode), Mode: mode, Target: sentinelServer.URL})
+	if err != nil {
+		t.Fatalf("%s sentinel prerequisite failed: %v", mode, err)
 	}
+	sentinelCleanupArmed := true
 	t.Cleanup(func() {
-		cleanupContext, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if !sentinelCleanupArmed {
+			return
+		}
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := client.Clean(cleanupContext, plan); err != nil {
-			t.Errorf("Clean: %v", err)
+		if err := cleanRealRegistrationIfStillOwned(cleanupContext, client, sentinel); err != nil {
+			t.Errorf("exact %s sentinel cleanup failed: %v; inspect before manually running %s", mode, err, sentinel.Cleanup.String())
 		}
 	})
+	if err := client.Apply(t.Context(), sentinel); err != nil {
+		t.Fatal(err)
+	}
+
+	subject, err := client.BuildPlan(t.Context(), Request{Name: "integration-" + string(mode), Mode: mode, Target: subjectServer.URL})
+	if err != nil {
+		t.Fatalf("%s subject prerequisite failed; two free authorized ports are required: %v", mode, err)
+	}
+	subjectCleanupArmed := true
+	t.Cleanup(func() {
+		if !subjectCleanupArmed {
+			return
+		}
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := cleanRealRegistrationIfStillOwned(cleanupContext, client, subject); err != nil {
+			t.Errorf("exact %s subject cleanup failed: %v; inspect before manually running %s", mode, err, subject.Cleanup.String())
+		}
+	})
+	if err := client.Apply(t.Context(), subject); err != nil {
+		t.Fatal(err)
+	}
+	assertRealTailscaleDataPath(t, subject.Registration, token)
+	if err := client.Clean(t.Context(), subject); err != nil {
+		t.Fatal(err)
+	}
+	subjectCleanupArmed = false
+	if err := client.verify(t.Context(), sentinel.Registration, true); err != nil {
+		t.Fatalf("%s subject cleanup changed the unrelated sentinel: %v", mode, err)
+	}
+	if err := client.Clean(t.Context(), sentinel); err != nil {
+		t.Fatal(err)
+	}
+	sentinelCleanupArmed = false
+	after := readRealServeConfiguration(t, client, executable)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("%s exact cleanup changed unrelated Tailscale configuration\nbefore: %#v\nafter:  %#v", mode, before, after)
+	}
+}
+
+func cleanRealRegistrationIfStillOwned(ctx context.Context, client Client, plan Plan) error {
+	snapshot, err := client.check(ctx, plan.Registration.Mode, false)
+	if err != nil {
+		return err
+	}
+	active, exists := snapshot.registrations[plan.Registration.Port]
+	if !exists {
+		return nil
+	}
+	wantFunnel := plan.Registration.Mode == Funnel
+	if active.target != plan.Registration.Target || active.funnel != wantFunnel {
+		return fmt.Errorf("%w: HTTPS port %d is no longer owned by this test", ErrConflict, plan.Registration.Port)
+	}
+	return client.Clean(ctx, plan)
+}
+
+func readRealServeConfiguration(t *testing.T, client Client, executable string) any {
+	t.Helper()
+	output, err := client.readOnly(t.Context(), executable, "serve", "status", "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var configuration any
+	if err := decodeOne(output, &configuration); err != nil {
+		t.Fatal(err)
+	}
+	return configuration
+}
+
+func assertRealTailscaleDataPath(t *testing.T, registration Registration, token string) {
+	t.Helper()
+	authority := registration.Host
+	if registration.Port != 443 {
+		authority += ":" + strconv.Itoa(int(registration.Port))
+	}
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	deadline := time.Now().Add(2 * time.Minute)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		response, err := client.Get("https://" + authority + "/")
+		if err == nil {
+			body, readErr := io.ReadAll(response.Body)
+			response.Body.Close()
+			if readErr == nil && string(body) == token {
+				return
+			}
+			lastErr = fmt.Errorf("body = %q, read error = %v", body, readErr)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("%s data path did not reach the real loopback backend: %v", registration.Mode, lastErr)
 }
