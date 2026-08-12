@@ -1,0 +1,40 @@
+name: Tailscale mutation integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Real Tailscale exposure mode to exercise
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - serve
+          - funnel
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portless-tailscale-mutation
+  cancel-in-progress: false
+
+jobs:
+  mutation:
+    name: Real Serve/Funnel mutation
+    runs-on: [self-hosted, macOS, tailscale-mutation]
+    environment: tailscale-mutation
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Exercise exact Tailscale mutation and cleanup
+        env:
+          PORTLESS_TEST_TAILSCALE_MUTATION: ${{ inputs.mode }}
+        run: go test -count=1 -run '^TestRealServeAndFunnelMutationPreserveUnrelatedConfigurationOptIn$' ./internal/tailscale

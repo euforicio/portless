@@ -100,6 +100,38 @@ owned registration, removes only that path, and verifies its disappearance.
 It never uses `serve reset` or `funnel reset`, because reset would remove
 unrelated configuration. No API invokes `sudo`.
 
+### Real mutation integration runner
+
+Ordinary pull-request and push CI never mutates Tailscale. The separate
+`Tailscale mutation integration` workflow is manual-only, uses the protected
+`tailscale-mutation` environment, targets a dedicated self-hosted runner with
+the `tailscale-mutation` label, and serializes all runs for that node. It runs
+the real CLI, real loopback HTTP servers, HTTPS data paths, and exact cleanup
+for Serve, Funnel, or both. The test snapshots the full Serve configuration
+before applying a sentinel and subject on two free ports. It proves subject
+cleanup leaves the sentinel exact, then requires the configuration to be
+identical after both exact per-port root cleanups.
+
+The runner must provide:
+
+- Go 1.26.5 or newer within the Go 1.26 line;
+- an official Tailscale CLI and daemon at version 1.98.9 or newer, running and
+  online on a persistent dedicated test-tailnet node;
+- MagicDNS, HTTPS certificates, the node's matching certificate domain, and
+  mutation permission for the workflow OS user without `sudo`;
+- for Funnel, live `funnel` and `funnel-ports` capabilities authorizing a free
+  pair of ports among 443, 8443, and 10000, including an explicit node
+  attribute for a tagged runner; and
+- no other Serve/Funnel writer on the node. Tailscale exposes check-then-mutate
+  CLI operations rather than an atomic compare-and-set, so runner-level
+  serialization is part of the safety boundary.
+
+Funnel creates a public internet endpoint. Use a disposable application
+backend and a dedicated node whose exposure is approved for this test. The
+workflow never runs a global reset. If cleanup reports an ownership conflict,
+inspect live status before using the exact per-port command printed by the
+test; do not remove a registration that no longer matches the test plan.
+
 Tailscale's current macOS documentation is inconsistent about Funnel support
 between its variant matrix and its dedicated Funnel pages. Portless therefore
 does not guess from the application variant: it limits itself to port proxying
