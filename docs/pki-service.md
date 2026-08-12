@@ -144,7 +144,8 @@ exact dispatch confirmation `RUN-PRIVILEGED-PORTLESS`, uses the dedicated
 `privileged-macos-integration` environment, runs only on a fresh GitHub-hosted
 macOS runner, rejects pre-existing Portless artifacts, and exercises real
 `init`, idempotent install/upgrade, launchd, system CA trust, HTTPS routing on
-ports 80/443, and uninstall. Repository administrators can add required
+port 443 with both privileged listeners bound, and uninstall. Repository
+administrators can add required
 reviewers to that environment for a second-party approval gate. The workflow's
 cleanup trap removes only the fixed Portless service and retained state paths.
 Final assertions verify that the job, artifacts, socket, public CA, and exact
