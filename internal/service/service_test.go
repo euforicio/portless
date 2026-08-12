@@ -29,11 +29,21 @@ func TestLaunchDaemonPlistPassesNativeValidation(t *testing.T) {
 		"<string>0077</string>",
 		"<string>127.0.0.1:80</string>",
 		"<string>[::1]:443</string>",
-		"<string>--container-cli</string>",
-		"<string>" + config.ContainerExecutable + "</string>",
 	} {
 		if !bytes.Contains(plist, []byte(required)) {
 			t.Errorf("plist is missing %q", required)
+		}
+	}
+	containerFlag := []byte("<string>--container-cli</string>")
+	if config.ContainerExecutable == "" {
+		if bytes.Contains(plist, containerFlag) {
+			t.Fatal("plist configures an unavailable optional container executable")
+		}
+	} else {
+		for _, required := range []string{string(containerFlag), "<string>" + config.ContainerExecutable + "</string>"} {
+			if !bytes.Contains(plist, []byte(required)) {
+				t.Errorf("plist is missing %q", required)
+			}
 		}
 	}
 	if bytes.Contains(plist, []byte("RunAtLoad")) {
