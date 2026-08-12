@@ -140,11 +140,13 @@ trust store, or write `/etc/hosts`.
 
 The manual `Privileged macOS integration` workflow covers the provisioned
 lifecycle that is unsafe on developer machines and ordinary CI. It requires the
-protected `privileged-macos-integration` environment plus the exact dispatch
-confirmation `RUN-PRIVILEGED-PORTLESS`, runs only on a fresh GitHub-hosted
+exact dispatch confirmation `RUN-PRIVILEGED-PORTLESS`, uses the dedicated
+`privileged-macos-integration` environment, runs only on a fresh GitHub-hosted
 macOS runner, rejects pre-existing Portless artifacts, and exercises real
 `init`, idempotent install/upgrade, launchd, system CA trust, HTTPS routing on
-ports 80/443, and uninstall. Its cleanup trap removes only the fixed Portless
-service and retained state paths. Final assertions verify that the job,
-artifacts, socket, public CA, and exact trusted certificate are absent after
-first observing uninstall's retained-state contract.
+ports 80/443, and uninstall. Repository administrators can add required
+reviewers to that environment for a second-party approval gate. The workflow's
+cleanup trap removes only the fixed Portless service and retained state paths.
+Final assertions verify that the job, artifacts, socket, public CA, and exact
+trusted certificate are absent after first observing uninstall's retained-state
+contract.
