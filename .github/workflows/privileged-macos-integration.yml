@@ -1,0 +1,82 @@
+name: Privileged macOS integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type RUN-PRIVILEGED-PORTLESS to provision the ephemeral runner
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: Privileged lifecycle (ephemeral macOS)
+    if: inputs.confirm == 'RUN-PRIVILEGED-PORTLESS'
+    runs-on: macos-15
+    environment: privileged-macos-integration
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify runner is clean
+        run: |
+          set -euo pipefail
+          test ! -e /usr/local/libexec/portless
+          test ! -e /Library/LaunchDaemons/com.euforicio.portless.plist
+          test ! -e /usr/local/share/portless/ca.pem
+          if /bin/launchctl print system/com.euforicio.portless >/dev/null 2>&1; then
+            echo "Portless launchd job already exists" >&2
+            exit 1
+          fi
+      - name: Build release-equivalent binary
+        run: go build -trimpath -o "$RUNNER_TEMP/portless" ./cmd/portless
+      - name: Exercise privileged lifecycle
+        env:
+          PORTLESS_BIN: ${{ runner.temp }}/portless
+        run: |
+          set -euo pipefail
+          cleanup() {
+            sudo "$PORTLESS_BIN" uninstall >/dev/null 2>&1 || true
+            sudo rm -rf "/Library/Application Support/Portless" "/var/run/portless"
+          }
+          trap cleanup EXIT
+
+          sudo -v
+          "$PORTLESS_BIN" init
+          "$PORTLESS_BIN" status
+          "$PORTLESS_BIN" trust status | grep -qx trusted
+
+          python3 -m http.server 18080 --bind 127.0.0.1 --directory "$RUNNER_TEMP" &
+          upstream_pid=$!
+          trap 'kill "$upstream_pid" >/dev/null 2>&1 || true; cleanup' EXIT
+          "$PORTLESS_BIN" add lifecycle-integration --port 18080 --pid "$upstream_pid"
+          curl --fail --silent --show-error https://lifecycle-integration.localhost/ >/dev/null
+
+          sudo "$PORTLESS_BIN" install
+          sudo "$PORTLESS_BIN" upgrade
+          sudo "$PORTLESS_BIN" upgrade
+          "$PORTLESS_BIN" doctor
+          sudo "$PORTLESS_BIN" uninstall
+
+          if /bin/launchctl print system/com.euforicio.portless >/dev/null 2>&1; then
+            echo "Portless launchd job remains after uninstall" >&2
+            exit 1
+          fi
+          test ! -e /usr/local/libexec/portless
+          test ! -e /Library/LaunchDaemons/com.euforicio.portless.plist
+          test ! -e /var/run/portless/management.sock
+          test ! -e /usr/local/share/portless/ca.pem
+          test -e "/Library/Application Support/Portless/pki/ca.pem"
+          ca_hash="$(openssl x509 -in "/Library/Application Support/Portless/pki/ca.pem" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d :)"
+          if /usr/bin/security find-certificate -a -Z /Library/Keychains/System.keychain | grep -Fq "$ca_hash"; then
+            echo "Portless CA remains trusted after uninstall" >&2
+            exit 1
+          fi

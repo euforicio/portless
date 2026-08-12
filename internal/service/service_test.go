@@ -2,6 +2,9 @@ package service
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -139,12 +142,55 @@ func TestLifecycleCommandsAreAuditable(t *testing.T) {
 	if !strings.Contains(install[1].String(), config.PlistPath) {
 		t.Fatalf("command is not auditable: %s", install[1].String())
 	}
+	upgrade, err := config.Commands(ActionUpgrade)
+	if err != nil || !slices.EqualFunc(install, upgrade, func(left, right Command) bool {
+		return left.Path == right.Path && slices.Equal(left.Args, right.Args) && left.WhenLoaded == right.WhenLoaded
+	}) {
+		t.Fatalf("upgrade commands = %+v, %v; want install plan %+v", upgrade, err, install)
+	}
+	if _, err := config.Commands(Action("invalid")); err == nil {
+		t.Fatal("unknown lifecycle action was accepted")
+	}
 }
 
 func TestLifecycleExecutorRejectsNonLaunchctlCommands(t *testing.T) {
-	err := ApplyCommands(t.Context(), []Command{{Path: "/usr/bin/true", Args: []string{"unexpected"}}})
-	if err == nil || !strings.Contains(err.Error(), "non-launchctl") {
-		t.Fatalf("ApplyCommands error = %v", err)
+	for _, command := range []Command{
+		{Path: "/usr/bin/true", Args: []string{"unexpected"}},
+		{Path: Launchctl},
+		{Path: Launchctl, Args: []string{"bootout", "user/501/example"}, WhenLoaded: true},
+		{Path: Launchctl, Args: []string{"print", "system/example"}, WhenLoaded: true},
+	} {
+		if err := ApplyCommands(t.Context(), []Command{command}); err == nil {
+			t.Fatalf("ApplyCommands accepted invalid command: %+v", command)
+		}
+	}
+}
+
+func TestRealLaunchdReadOnlyStatusAndAbsentUninstall(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd integration requires macOS")
+	}
+	config := temporaryConfig(t)
+	config.Label = fmt.Sprintf("com.euforicio.portless.test.%d", os.Getpid())
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	loaded, err := config.Loaded(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded {
+		t.Fatalf("test launchd label unexpectedly exists: %s", config.Label)
+	}
+	commands, err := config.Commands(ActionUninstall)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyCommands(ctx, commands); err != nil {
+		t.Fatalf("conditional uninstall for absent launchd job: %v", err)
+	}
+	if _, err := os.Lstat(config.PlistPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only launchd lifecycle created a plist: %v", err)
 	}
 }
 

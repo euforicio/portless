@@ -462,6 +462,39 @@ func TestSystemTrustInspectionUsesExactCertificate(t *testing.T) {
 	}
 }
 
+func TestApplyTrustRefusesOrdinaryUserWithoutMutation(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("system keychain inspection requires macOS")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("ordinary-user trust boundary requires a non-root test process")
+	}
+	authority, err := Open(filepath.Join(t.TempDir(), "pki"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	caPath := authority.RootCertificatePath()
+	before, err := SystemTrusted(ctx, caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before {
+		t.Fatal("fresh temporary root unexpectedly exists in the system keychain")
+	}
+	if err := ApplyTrust(ctx, TrustInstall, caPath); err == nil || !strings.Contains(err.Error(), "requires root") {
+		t.Fatalf("ordinary-user trust install error = %v", err)
+	}
+	after, err := SystemTrusted(ctx, caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after {
+		t.Fatal("rejected ordinary-user trust install changed the system keychain")
+	}
+}
+
 func assertMode(t *testing.T, path string, want os.FileMode) {
 	t.Helper()
 	info, err := os.Lstat(path)

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/euforicio/portless/internal/client"
 	"github.com/euforicio/portless/internal/daemon"
+	"github.com/euforicio/portless/internal/hosts"
 	"github.com/euforicio/portless/internal/lan"
 	"github.com/euforicio/portless/internal/mdns"
 	"github.com/euforicio/portless/internal/runner"
@@ -86,6 +88,125 @@ func TestCommandSurfaceUsesRealManagementSocket(t *testing.T) {
 		}
 	}
 
+}
+
+func TestPrivilegedLifecycleRejectsOrdinaryUserBeforeMutation(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("privileged lifecycle is supported only on macOS")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("ordinary-user lifecycle boundary requires a non-root test process")
+	}
+	for _, test := range []struct {
+		arguments []string
+		message   string
+	}{
+		{[]string{"install"}, "service installation requires root"},
+		{[]string{"upgrade"}, "service installation requires root"},
+		{[]string{"uninstall"}, "service removal requires root"},
+		{[]string{"trust", "install"}, "trust mutation is privileged"},
+		{[]string{"trust", "remove"}, "trust mutation is privileged"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(t.Context(), test.arguments, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), test.message) {
+			t.Errorf("run(%v) = %d, stdout=%q stderr=%q; want %q", test.arguments, code, stdout.String(), stderr.String(), test.message)
+		}
+	}
+}
+
+func TestInitStopsAtReadOnlyManagementGroupPreflight(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("init is supported only on macOS")
+	}
+	group := fmt.Sprintf("portless-test-missing-%d", os.Getpid())
+	if _, err := user.LookupGroup(group); err == nil {
+		t.Fatalf("test management group unexpectedly exists: %s", group)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run(t.Context(), []string{
+		"init", "--management-group", group,
+		"--scheme", "http", "--listen", "127.0.0.1:8080", "--tld", ".test",
+	}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "preflight management group") {
+		t.Fatalf("init = %d, stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestReadOnlyHostsAndTrustCommandsPreserveSystemState(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS system boundary integration")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("ordinary-user hosts boundary requires a non-root test process")
+	}
+	hostsBefore, err := os.ReadFile("/etc/hosts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostsInfoBefore, err := os.Stat("/etc/hosts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicCABefore, publicCAErr := os.ReadFile(publicCACertificatePath)
+	if publicCAErr != nil && !errors.Is(publicCAErr, os.ErrNotExist) {
+		t.Fatal(publicCAErr)
+	}
+
+	socketPath := startRuntime(t, "")
+	t.Setenv("PORTLESS_SOCKET", socketPath)
+	name := fmt.Sprintf("privileged-lifecycle-%d", os.Getpid())
+	for _, arguments := range [][]string{
+		{"add", name, "--port", "65534", "--pid", strconv.Itoa(os.Getpid())},
+		{"trust", "status"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(t.Context(), arguments, &stdout, &stderr); code != 0 {
+			t.Fatalf("run(%v) = %d, stdout=%q stderr=%q", arguments, code, stdout.String(), stderr.String())
+		}
+	}
+	stat, ok := hostsInfoBefore.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("/etc/hosts stat does not expose ownership")
+	}
+	hostsConfig := hosts.Config{
+		Path:     "/etc/hosts",
+		LockPath: fmt.Sprintf("/etc/.portless-test-%d.lock", os.Getpid()),
+		UID:      int(stat.Uid),
+		GID:      int(stat.Gid),
+		Mode:     hostsInfoBefore.Mode().Perm(),
+	}
+	plan, err := hostsConfig.SynchronizePlan([]string{name + ".localhost"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Changed {
+		t.Fatal("live hosts plan unexpectedly reports no change")
+	}
+	if _, err := hostsConfig.Apply(plan); !errors.Is(err, hosts.ErrPrivilegeRequired) {
+		t.Fatalf("live hosts apply error = %v, want ErrPrivilegeRequired", err)
+	}
+	if _, err := os.Lstat(hostsConfig.LockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected hosts apply created a lock: %v", err)
+	}
+
+	hostsAfter, err := os.ReadFile("/etc/hosts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostsInfoAfter, err := os.Stat("/etc/hosts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(hostsAfter, hostsBefore) || hostsInfoAfter.ModTime() != hostsInfoBefore.ModTime() || hostsInfoAfter.Mode() != hostsInfoBefore.Mode() {
+		t.Fatal("read-only hosts commands changed /etc/hosts")
+	}
+	publicCAAfter, err := os.ReadFile(publicCACertificatePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(publicCAAfter, publicCABefore) || errors.Is(err, os.ErrNotExist) != errors.Is(publicCAErr, os.ErrNotExist) {
+		t.Fatal("trust status changed public CA metadata")
+	}
 }
 
 func TestBuiltExecutableRunsDaemonAndOrdinaryCLI(t *testing.T) {
