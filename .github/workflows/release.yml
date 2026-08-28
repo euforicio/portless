@@ -14,7 +14,7 @@ concurrency:
 jobs:
   validate:
     name: Validate tag
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -56,7 +56,7 @@ jobs:
   release:
     name: Publish release
     needs: validate
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 20
     permissions:
       attestations: write

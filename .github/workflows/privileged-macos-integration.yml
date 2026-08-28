@@ -15,7 +15,7 @@ jobs:
   lifecycle:
     name: Privileged lifecycle (ephemeral macOS)
     if: inputs.confirm == 'RUN-PRIVILEGED-PORTLESS'
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     environment: privileged-macos-integration
     timeout-minutes: 15
     steps:

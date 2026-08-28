@@ -1,3 +1,4 @@
 self-hosted-runner:
   labels:
+    - blacksmith-6vcpu-macos-15
     - tailscale-mutation
