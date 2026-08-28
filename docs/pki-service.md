@@ -141,8 +141,9 @@ trust store, or write `/etc/hosts`.
 The manual `Privileged macOS integration` workflow covers the provisioned
 lifecycle that is unsafe on developer machines and ordinary CI. It requires the
 exact dispatch confirmation `RUN-PRIVILEGED-PORTLESS`, uses the dedicated
-`privileged-macos-integration` environment, runs only on a fresh GitHub-hosted
-macOS runner, rejects pre-existing Portless artifacts, and exercises real
+`privileged-macos-integration` environment, runs only on a fresh
+Blacksmith-hosted Apple Silicon macOS runner, rejects pre-existing Portless
+artifacts, and exercises real
 `init`, idempotent install/upgrade, launchd, system CA trust, HTTPS routing on
 port 443 with both privileged listeners bound, and uninstall. Repository
 administrators can add required
