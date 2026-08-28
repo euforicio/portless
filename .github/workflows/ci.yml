@@ -17,7 +17,7 @@ concurrency:
 jobs:
   test:
     name: Test (macOS)
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -47,7 +47,7 @@ jobs:
 
   lint:
     name: golangci-lint
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 10
     steps:
       - name: Check out repository
@@ -65,7 +65,7 @@ jobs:
 
   vulnerability-scan:
     name: govulncheck
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 10
     steps:
       - name: Check out repository
@@ -80,7 +80,7 @@ jobs:
 
   workflow-lint:
     name: actionlint
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 5
     steps:
       - name: Check out repository
@@ -97,7 +97,7 @@ jobs:
 
   release-check:
     name: GoReleaser check and snapshot
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 15
     steps:
       - name: Check out repository
