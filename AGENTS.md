@@ -44,3 +44,9 @@ go test -race ./...
 
 Integration behavior must be verified with real HTTP, HTTPS, HTTP/2, WebSocket,
 Unix-socket, launchd-plist, and Apple-container execution paths as applicable.
+
+## Delivery workflow
+
+Use [README.md](README.md#agent-delivery-and-ci-policy) for isolated worktrees,
+independent review, exact-tree acceptance and serialized integration. Direct-main
+is a proposed gated workflow; preserve current protections and publication authorization.

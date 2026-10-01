@@ -156,3 +156,72 @@ GitHub Actions exposes the same path only through the manually dispatched
 and a provisioned self-hosted runner carrying the standard `macOS` and `ARM64`
 labels, so ordinary pull-request and push CI never attempts unsupported nested
 virtualization on hosted runners.
+
+## Agent delivery and CI policy
+
+This is the intended local-first integration workflow. These instructions do not
+implement a shipping service or authorize publication; current protections,
+review requirements and release approvals still apply.
+
+### Local acceptance
+
+Iterate with the owning Go package test. Final acceptance preserves `go fmt ./...`, `go vet ./...`, `go test ./...` and `go test -race ./...` from
+`AGENTS.md`. Exercise affected real sockets/listeners; privileged
+installation/CA, Apple Container and Tailscale mutation lanes require their
+existing explicit opt-ins and qualified macOS host.
+
+### Serialized integration
+
+1. Use one isolated branch/worktree per change. Preserve dirty user checkouts;
+   give parallel work its own ports, databases and output paths. Inspect current
+   source and run targeted tests while editing.
+2. Obtain independent review of the diff and evidence before integration.
+   Auth, payments, permissions, migrations, runtime isolation and release/CI
+   changes require the designated owner's review and existing stronger gates.
+3. One coordinator owns integration for each repository. Under a shared lock or
+   queue, fetch current `main`, rebase one candidate onto it, resolve conflicts
+   and validate the exact final tree with the repository's full acceptance gate.
+   Record base SHA, candidate SHA/tree, commands, toolchain/platform, results and
+   reviewer disposition. Unavailable required checks block landing.
+4. Any edit, conflict resolution, rebase or integration changes the candidate and
+   invalidates its earlier validation. Repeat applicable/full acceptance and
+   refresh review for the final diff. Recheck main before landing; if it moved,
+   rebase and validate again. No stale green result or force push.
+5. Only with publication authorization and compatible protections, land by a
+   normal fast-forward-only update. Otherwise use the required PR/merge-queue
+   path and validate its final integration tree. Never bypass hooks, required
+   reviews, environments or branch rules. Watch checks for the landed main SHA;
+   freeze integration on failure and prepare a reviewed revert/recovery.
+
+### CI and build lifecycle
+
+`.github/workflows/ci.yml` is routine validation; the privileged macOS, Apple
+Container and Tailscale workflows are distinct acceptance boundaries. Selective
+CI must not quietly skip them for affected changes. Signed/versioned release
+assets and rollback binaries are separate from temporary integration evidence.
+
+Selective CI is a target: select changed components and their dependents, keep
+an always-present truthful required summary, and retain full platform/security
+freshness and every release gate. Reuse only immutable verified outputs whose
+source SHA/tree, toolchain, lockfiles, build inputs and platform/variant match;
+verify digest/provenance before promotion. A dependency cache hit is not proof
+of acceptance, and rebuilding creates a new product requiring validation.
+
+The routine main-build target is **two successful builds per platform/variant**
+(OS, architecture and build flavor/channel), counted after trusted successful
+qualification. Failed/cancelled runs do not displace a known-good build. Protect
+active handoffs, pinned consumers, approved release candidates, diagnostic/audit
+exceptions and rollback products until their needs end. Published releases and
+registry/image assets have their own compatibility/rollback policy; do not prune
+them with disposable CI artifacts. Time-based `retention-days` alone cannot
+implement a two-build count. Cleanup must remain inactive/dry-run until separately
+approved with the exact candidates and consumer exclusions.
+
+Still to implement: a coordinator/queue shared across agent threads and hosts,
+an exact-tree acceptance record with invalidation, protection-aware landing and
+main-check monitoring, and consumer-aware retention/reuse where absent. Local
+worktree isolation and deployment concurrency do not provide that shared lock.
+
+Background: [The Amp Way](https://ampcode.com/docs/using-amp/how-we-work) and
+[Shipping Changes](https://ampcode.com/docs/orbs/shipping). Their delivery model
+informs this proposal; their commands/settings are not this repository's policy.
